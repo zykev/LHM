@@ -52,6 +52,11 @@ class MixerDataset(torch.utils.data.Dataset):
         dataset_cls = None
         if name == "video_human":
             from .video_human import VideoHumanDataset
+            dataset_cls = VideoHumanDataset
+
+        elif name == "dress4d_lhm":
+            from .dress4d_lhm import Dress4DLHMDataset
+            dataset_cls = Dress4DLHMDataset
 
         else:
             raise NotImplementedError(f"Dataset {name} not implemented")

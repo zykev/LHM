@@ -18,3 +18,4 @@ from LHM.utils.registry import Registry
 REGISTRY_RUNNERS = Registry()
 
 from .infer import *
+from .train import *

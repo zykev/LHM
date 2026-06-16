@@ -1,0 +1,200 @@
+# ============================================================
+# LHM-mini 在 4DDress 多视角数据集上的训练配置
+# ============================================================
+# 前置步骤：
+#   1. 运行 prepare_4ddress.py 生成 smplx_params/, cameras.json, (flame_params/)
+#   2. 确认 pretrained_models/ 下所有资产已下载（见 README）
+# 启动：
+#   accelerate launch --config_file configs/accelerate.yaml \
+#       -m LHM.launch train.human_lrm \
+#       --config configs/training/human-lrm-mini-4ddress.yaml
+# ============================================================
+
+experiment:
+  type: lrm
+  seed: 42
+  parent: LHM-training-4ddress
+  child: LHM-MINI
+
+# ----------------------------------------------------------
+# 模型配置（与 inference/human-lrm-mini.yaml 保持一致）
+# ----------------------------------------------------------
+model:
+  model_name: SapDinoLRMBHSD3_5
+  encoder_type: dinov2_fusion
+  encoder_model_name: dinov2_vitl14_reg
+  encoder_feat_dim: 1024
+  encoder_freeze: false
+  fine_encoder_type: sapiens
+  fine_encoder_model_name: ./pretrained_models/sapiens/pretrained/checkpoints/sapiens_1b/sapiens_1b_epoch_173_torchscript.pt2
+  fine_encoder_feat_dim: 1536
+  fine_encoder_freeze: true
+  use_face_id: true                   # face_id loss 依赖 FLAME 参数
+  latent_query_points_type: e2e_smplx_sub1
+  pcl_dim: 1024
+  facesr: false                       # 训练阶段关闭 ESRGAN（开启会大幅降速）
+  transformer_type: sd3_mm_bh_cond
+  transformer_heads: 16
+  transformer_dim: 1024
+  transformer_layers: 2               # MINI 版本
+  tf_grad_ckpt: true
+  encoder_grad_ckpt: true
+  human_model_path: ./pretrained_models/human_model_files
+  smplx_subdivide_num: 1
+  smplx_type: smplx_2
+  gs_query_dim: 1024
+  gs_use_rgb: true
+  gs_sh: 3
+  dense_sample_pts: 20000
+  gs_mlp_network_config:
+    n_neurons: 512
+    n_hidden_layers: 2
+    activation: silu
+  gs_xyz_offset_max_step: 1.0
+  gs_clip_scaling:
+    - 100
+    - 0.01
+    - 0.05
+    - 3000
+  expr_param_dim: 100
+  shape_param_dim: 10
+  fix_opacity: false
+  fix_rotation: false
+  cano_pose_type: 1
+
+# ----------------------------------------------------------
+# 数据集配置
+# ----------------------------------------------------------
+dataset:
+  subsets:
+    - name: dress4d_lhm
+      # root_dirs：prepare_4ddress.py 的 output_dir（已处理数据）
+      root_dirs:
+        - ./train_data/4ddress_lhm
+      meta_path:
+        train: ./train_data/4ddress_lhm/label/train_list.json
+        val:   ./train_data/4ddress_lhm/label/val_list.json
+      sample_rate: 1.0
+      use_flame: false        # 若 prepare_4ddress.py 已跑 flame，可改为 true
+      src_head_size: 112
+
+  # 4DDress 共 4 路相机：前视角为 source，全部 4 路同时作为 target（含前视角自重建）
+  sample_side_views: 4
+
+  # 原始 4DDress 数据路径（Dataset 直接从此处读取各视角图像）
+  raw_data_dir: ".datasets/4ddress"
+
+  source_image_res: 512
+  render_image:
+    low: 384
+    high: 384
+    region: null
+
+  num_train_workers: 4
+  num_val_workers: 2
+  multiply: 16
+  pin_mem: true
+  repeat_num: 1
+
+# ----------------------------------------------------------
+# 训练超参数
+# ----------------------------------------------------------
+train:
+  mixed_precision: bf16
+  find_unused_parameters: false
+
+  loss_func:
+    pixel_loss: l1
+    ball_loss:
+      type: heuristic
+      group:
+        head: 1.0
+        lower_body: 100.0
+        upper_body: 1000.0
+        hands: 10000.0
+    offset_loss:
+      type: classical
+      group:
+        head: 1.0
+        lower_body: 1.0
+        upper_body: 100.0
+        hands: 1000.0
+
+  loss:
+    pixel_weight: 0.0
+    masked_pixel_weight: 1.0
+    perceptual_weight: 1.0
+    mask_weight: "0:2.0:1.0:3000"
+    face_id_weight: "0:0.01:0.05:3000"   # 若 use_flame=false 可设为 0
+    asap_weight: "0:1.0:10.0:3000"
+    acap_weight: "0:1.0:1000.0:3000"
+
+  optim:
+    lr: 0.0004
+    weight_decay: 0.05
+    beta1: 0.9
+    beta2: 0.95
+    clip_grad_norm: 0.1
+
+  scheduler:
+    type: cosine
+    warmup_real_iters: 3000
+
+  # 4DDress 图像分辨率高，batch_size 适当减小
+  # 16GB GPU 建议 batch_size=1, accum_steps=4
+  # 40GB GPU 可用 batch_size=2, accum_steps=2
+  batch_size: 2
+  accum_steps: 2
+  epochs: 60
+
+# ----------------------------------------------------------
+# 验证
+# ----------------------------------------------------------
+val:
+  batch_size: 1
+  global_step_period: 500
+  debug_batches: 10
+
+# ----------------------------------------------------------
+# Checkpoint
+# ----------------------------------------------------------
+saver:
+  auto_resume: true
+  load_model: null          # 从 scratch 训练设 null；fine-tune 填写 checkpoint 路径
+  checkpoint_root: ./exps/checkpoints
+  checkpoint_global_steps: 500
+  checkpoint_keep_level: 20
+
+# ----------------------------------------------------------
+# 日志
+# ----------------------------------------------------------
+logger:
+  stream_level: WARNING
+  log_level: INFO
+  log_root: ./exps/logs
+  tracker_root: ./exps/trackers
+  enable_profiler: false
+  trackers:
+    - tensorboard
+    - wandb
+  wandb:
+    entity: ""             # 你的 wandb entity（用户名或团队名）；留空使用默认
+    project: "lhm-training"
+    name: "lhm-mini-4ddress"
+    tags:
+      - lhm
+      - 4ddress
+      - mini
+    notes: ""
+    run_id: null           # 设置 run id 可在中断后 resume 同一 run
+  image_monitor:
+    train_global_steps: 500
+    samples_per_log: 2
+
+# ----------------------------------------------------------
+# torch.compile（调试时建议 disable: true）
+# ----------------------------------------------------------
+compile:
+  suppress_errors: true
+  print_specializations: false
+  disable: true

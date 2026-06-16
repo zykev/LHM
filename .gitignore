@@ -8,6 +8,9 @@
 .vscode/
 .idea/
 
+.datasets/
+.checkpoints/
+
 # Ignore operating system files
 .DS_Store
 Thumbs.db
