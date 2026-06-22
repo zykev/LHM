@@ -89,19 +89,13 @@ def _build_intrinsic_4x4(cam_info: dict, target_w: int) -> torch.Tensor:
     return mat
 
 
-def _find_capture_file(cam_raw_dir: str, frame_idx: int, subdir: str, ext: str = '*.png') -> str:
-    """查找 4DDress Capture/{cam}/{subdir}/mesh-*{frame}*.png，失败时按排序索引 fallback。
-    支持两种命名：mesh-f{frame:05d}-*.png 和 mesh-{frame:06d}-*.png。
+def _find_capture_file(cam_raw_dir: str, frame_idx: int, subdir: str) -> str:
+    """构造 4DDress Capture/{cam}/{subdir} 下的文件路径。
+    命名规则：images/capture-f{frame:05d}.png，masks/mask-f{frame:05d}.png。
     """
-    base = os.path.join(cam_raw_dir, subdir)
-    for pattern in (f'mesh-f{frame_idx:05d}-{ext}', f'mesh-{frame_idx:06d}-{ext}'):
-        hits = glob.glob(os.path.join(base, pattern))
-        if hits:
-            return sorted(hits)[0]
-    all_files = sorted(glob.glob(os.path.join(base, '*.png')))
-    if frame_idx - 1 < len(all_files):
-        return all_files[frame_idx - 1]
-    return ''
+    prefix = 'capture' if subdir == 'images' else 'mask'
+    path = os.path.join(cam_raw_dir, subdir, f'{prefix}-f{frame_idx:05d}.png')
+    return path if os.path.exists(path) else ''
 
 
 # ---------------------------------------------------------------------------
