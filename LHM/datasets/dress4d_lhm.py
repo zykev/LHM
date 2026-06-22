@@ -215,6 +215,7 @@ class Dress4DLHMDataset(BaseDataset):
         lhand     = _t('lhand_pose', (15, 3))
         rhand     = _t('rhand_pose', (15, 3))
         expr      = _t('expr',       (100,))
+        trans     = _t('trans',      (3,))
 
         def _expand(t):
             return t.unsqueeze(0).expand(N_tgt, *t.shape).clone()
@@ -228,6 +229,7 @@ class Dress4DLHMDataset(BaseDataset):
             'lhand_pose': _expand(lhand),
             'rhand_pose': _expand(rhand),
             'expr':       _expand(expr),
+            'trans':      _expand(trans),
             'betas':      betas,
         }
 
