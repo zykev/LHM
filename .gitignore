@@ -67,3 +67,5 @@ pretrained_models
 train_data
 lhm_cuda_dockers/
 gfpgan/
+
+*tar
