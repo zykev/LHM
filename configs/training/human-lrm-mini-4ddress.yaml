@@ -101,7 +101,10 @@ dataset:
 # ----------------------------------------------------------
 train:
   mixed_precision: bf16
-  find_unused_parameters: false
+  # 模型条件分支较多（use_face_id、id_face_net 仅在权重>0时使用等），多卡 DDP
+  # 下容易出现某些参数某些 step 不参与反向传播，直接设 true 更安全。
+  # 单卡训练时这个值不影响任何东西。
+  find_unused_parameters: true
 
   loss_func:
     pixel_loss: l1

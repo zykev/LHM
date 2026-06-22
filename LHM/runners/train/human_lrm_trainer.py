@@ -24,8 +24,9 @@ from collections import defaultdict
 import kornia.metrics as kornia_metrics
 import torch
 import torch.nn.functional as F
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.logging import get_logger
+from accelerate.utils import set_seed
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -44,6 +45,14 @@ from LHM.runners import REGISTRY_RUNNERS
 from LHM.runners.abstract import Runner
 
 logger = get_logger(__name__)
+
+# 固定的 key 列表，用于多卡聚合时构造定长 tensor。不能直接用本地 dict 的 key 集合，
+# 因为各 loss 是否出现取决于动态权重调度/try-except（如 face_id），在某些 rank 上
+# 可能和别的 rank 不一致；验证集样本数很少时，甚至某个 rank 分到的 shard 可能为空，
+# 导致它的 agg dict 完全没有 key——这些情况下用不定长 tensor 做 all-reduce 会在
+# 多卡间形状不一致而卡死/报错。
+_LOSS_KEYS = ('masked_pixel', 'perceptual', 'mask', 'face_id', 'asap', 'acap')
+_METRIC_KEYS = ('psnr', 'ssim', 'lpips')
 
 
 # ===========================================================================
@@ -174,11 +183,21 @@ class HumanLRMTrainer(Runner):
 
     def _setup_accelerator(self):
         tc = self.cfg.train
+        # 多卡训练用 DDP 时，模型里大量条件分支（use_face_id、latent_query_points_type
+        # 分支、id_face_net 只在 w_fid>0 时用到等）很容易导致某些参数在某些 step 不
+        # 参与反向传播——DDP 默认 find_unused_parameters=False 时会直接崩。这里把
+        # train.find_unused_parameters 接到 DistributedDataParallelKwargs 上（单卡
+        # /未用 accelerate launch 时这个 kwargs 不生效，无副作用）。
+        ddp_kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=tc.get('find_unused_parameters', False)
+        )
         self.accelerator = Accelerator(
             mixed_precision=tc.get('mixed_precision', 'bf16'),
             gradient_accumulation_steps=tc.get('accum_steps', 1),
             log_with=None,
+            kwargs_handlers=[ddp_kwargs],
         )
+        set_seed(self.cfg.experiment.get('seed', 42))
 
     def _setup_logger(self):
         log_root = os.path.join(self.exp_dir, 'logs')
@@ -792,11 +811,30 @@ class HumanLRMTrainer(Runner):
 
         self.model.train()
 
-        if count == 0:
+        # accelerator.prepare() 之后 val_loader 会把验证集切分到各 rank，每个 rank
+        # 上面这段循环只跑到了自己那一份 shard。这里用固定 key 的 tensor 做一次
+        # all-reduce sum，把所有 rank 的 loss/metric 总和、样本数加起来，再统一在
+        # 下面除以全局 count，否则多卡训练时打印/记录的验证结果只反映 rank0 那一份
+        # 数据，而不是整个验证集。reduce 是 collective op，必须每个 rank 都无条件
+        # 调用，不能放在 count==0 的 early return 之后。
+        stats = torch.tensor(
+            [agg.get(k, 0.0) for k in _LOSS_KEYS]
+            + [agg_metrics.get(k, 0.0) for k in _METRIC_KEYS]
+            + [float(count)],
+            device=device,
+        )
+        stats = self.accelerator.reduce(stats, reduction='sum')
+        n_loss = len(_LOSS_KEYS)
+        global_count = stats[-1].item()
+
+        if global_count == 0:
             return {}
-        avg = {k: v / count for k, v in agg.items()}
+
+        avg = {k: stats[i].item() / global_count for i, k in enumerate(_LOSS_KEYS)}
         avg['total'] = sum(avg.values())
-        avg.update({k: v / count for k, v in agg_metrics.items()})
+        avg.update({
+            k: stats[n_loss + i].item() / global_count for i, k in enumerate(_METRIC_KEYS)
+        })
 
         self._log_scalars(avg, 'val', self.global_step)
 
@@ -828,7 +866,9 @@ class HumanLRMTrainer(Runner):
 
         for epoch in range(tc.epochs):
             for batch in self.train_loader:
-                self.model.hyper_step(self.global_step)
+                # hyper_step 是模型自定义方法，accelerator.prepare() 后 self.model
+                # 可能被 DistributedDataParallel 包装，需要 unwrap 才能调用自定义方法。
+                self.accelerator.unwrap_model(self.model).hyper_step(self.global_step)
 
                 # 训练阶段只记录 loss/metrics，不记录图片（图片只在 _validate() 里记录）
                 should_log_scalars = (
@@ -867,10 +907,14 @@ class HumanLRMTrainer(Runner):
                 if self.global_step % val_period == 0:
                     self._validate()
 
-                # Checkpoint
+                # Checkpoint（存档前后加 barrier，避免其他 rank 在主进程写盘时
+                # 跑到下一轮反向传播，导致各 rank step 不同步）
                 if self.global_step % ckpt_period == 0:
+                    self.accelerator.wait_for_everyone()
                     self._save_checkpoint()
+                    self.accelerator.wait_for_everyone()
 
         # 训练结束保存最终 checkpoint
+        self.accelerator.wait_for_everyone()
         self._save_checkpoint()
         logger.info('训练完成。')
