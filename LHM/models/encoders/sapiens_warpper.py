@@ -220,7 +220,7 @@ class SapiensWrapper(nn.Module):
             image.shape[-1] // 16,
         )
 
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.no_grad():
             (out_local,) = self.model(image)
 
         out_global = None
