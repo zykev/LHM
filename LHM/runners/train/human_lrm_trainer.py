@@ -21,6 +21,7 @@ import sys
 import time
 from collections import defaultdict
 
+import kornia.metrics as kornia_metrics
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
@@ -118,6 +119,7 @@ class HumanLRMTrainer(Runner):
     def __init__(self):
         super().__init__()
         self.cfg = self._load_config()
+        self._setup_exp_dir()
         self._setup_compile()
         self._setup_accelerator()
         self._setup_logger()
@@ -127,6 +129,16 @@ class HumanLRMTrainer(Runner):
         self._setup_losses()
         self.global_step = 0
         self._resume_if_needed()
+
+    def _setup_exp_dir(self):
+        """统一实验目录：exps_root/<wandb name>/{logs,trackers,checkpoints,wandb}/。
+        用 wandb 的 name 字段作为文件夹名，没配置 name 时回退到 experiment.parent/child。
+        """
+        exp = self.cfg.experiment
+        wandb_name = self.cfg.logger.get('wandb', {}).get('name', None) or f'{exp.parent}_{exp.child}'
+        exps_root = self.cfg.logger.get('exps_root', './exps')
+        self.exp_dir = os.path.join(exps_root, wandb_name)
+        os.makedirs(self.exp_dir, exist_ok=True)
 
     def _setup_compile(self):
         """将 cfg.compile 中的设置应用到 torch._dynamo（模型里的 @torch.compile
@@ -169,7 +181,7 @@ class HumanLRMTrainer(Runner):
         )
 
     def _setup_logger(self):
-        log_root = self.cfg.logger.get('log_root', './exps/logs')
+        log_root = os.path.join(self.exp_dir, 'logs')
         os.makedirs(log_root, exist_ok=True)
         logging.basicConfig(
             level=logging.INFO,
@@ -180,7 +192,7 @@ class HumanLRMTrainer(Runner):
             ],
         )
         if self.accelerator.is_main_process:
-            tracker_root = self.cfg.logger.get('tracker_root', './exps/trackers')
+            tracker_root = os.path.join(self.exp_dir, 'trackers')
             os.makedirs(tracker_root, exist_ok=True)
             trackers = self.cfg.logger.get('trackers', ['tensorboard'])
             if 'tensorboard' in trackers:
@@ -223,6 +235,7 @@ class HumanLRMTrainer(Runner):
             id=run_id,
             resume='allow' if run_id else None,
             config=OmegaConf.to_container(self.cfg, resolve=True),
+            dir=self.exp_dir,  # wandb 会在此目录下创建 wandb/run-.../，与 logs/trackers/checkpoints 同级
         )
         self.use_wandb = True
         logger.info(f'wandb 初始化: project={project}, name={name or exp_name}')
@@ -499,11 +512,7 @@ class HumanLRMTrainer(Runner):
     # ── Checkpoint ──────────────────────────────────────────────────────────
 
     def _ckpt_dir(self) -> str:
-        d = os.path.join(
-            self.cfg.saver.get('checkpoint_root', './exps/checkpoints'),
-            self.cfg.experiment.parent,
-            self.cfg.experiment.child,
-        )
+        d = os.path.join(self.exp_dir, 'checkpoints')
         os.makedirs(d, exist_ok=True)
         return d
 
@@ -633,6 +642,34 @@ class HumanLRMTrainer(Runner):
 
         return losses
 
+    @torch.no_grad()
+    def _compute_eval_metrics(self, render_out: dict, batch: dict) -> dict:
+        """
+        计算 PSNR / SSIM / LPIPS 评估指标（不加权、不参与反向传播，只用于监控）。
+        在 mask 区域内比较，与 masked_pixel loss 保持一致的比较口径——否则渲染器
+        合成的背景色和真实照片背景对不上，会让指标失真。
+        """
+        pred_rgb  = render_out['comp_rgb'].contiguous().float().clamp(0, 1)
+        gt_images = batch['render_images'].float().clamp(0, 1)
+        gt_masks  = batch['render_masks'].float()
+
+        pred_masked = pred_rgb * gt_masks
+        gt_masked   = gt_images * gt_masks
+
+        B, N, C, H, W = pred_masked.shape
+        pred_flat = pred_masked.reshape(B * N, C, H, W)
+        gt_flat   = gt_masked.reshape(B * N, C, H, W)
+
+        psnr_val = kornia_metrics.psnr(pred_flat, gt_flat, max_val=1.0).mean()
+        ssim_val = kornia_metrics.ssim(pred_flat, gt_flat, window_size=11, max_val=1.0).mean()
+        lpips_val = self.perceptual_loss(pred_masked, gt_masked, is_training=False)
+
+        return {
+            'psnr':  psnr_val.item(),
+            'ssim':  ssim_val.item(),
+            'lpips': lpips_val.item(),
+        }
+
     # ── 单步训练 ─────────────────────────────────────────────────────────────
 
     def _train_step(self, batch: dict, return_render_out: bool = False):
@@ -705,6 +742,7 @@ class HumanLRMTrainer(Runner):
         n_log   = img_mon.get('samples_per_log', 2)
 
         agg = defaultdict(float)
+        agg_metrics = defaultdict(float)
         count = 0
         first_render_out = None
         first_batch      = None
@@ -741,6 +779,8 @@ class HumanLRMTrainer(Runner):
             losses = self._compute_losses(render_out, batch_dev)
             for k, v in losses.items():
                 agg[k] += v.item() if isinstance(v, torch.Tensor) else v
+            for k, v in self._compute_eval_metrics(render_out, batch_dev).items():
+                agg_metrics[k] += v
             count += 1
 
             # Keep the first batch for image logging
@@ -756,6 +796,7 @@ class HumanLRMTrainer(Runner):
             return {}
         avg = {k: v / count for k, v in agg.items()}
         avg['total'] = sum(avg.values())
+        avg.update({k: v / count for k, v in agg_metrics.items()})
 
         self._log_scalars(avg, 'val', self.global_step)
 
@@ -775,14 +816,11 @@ class HumanLRMTrainer(Runner):
         tc        = self.cfg.train
         val_cfg   = self.cfg.val
         saver_cfg = self.cfg.saver
-        img_mon   = self.cfg.logger.get('image_monitor', {})
 
         self.model.train()
-        log_interval  = 50
+        log_interval  = self.cfg.logger.get('log_global_steps', 50)
         ckpt_period   = saver_cfg.get('checkpoint_global_steps', 1000)
         val_period    = val_cfg.get('global_step_period', 1000)
-        img_period    = img_mon.get('train_global_steps', 500)
-        n_log         = img_mon.get('samples_per_log', 2)
         total_steps   = len(self.train_loader) * tc.epochs
 
         logger.info(f'开始训练，总步数约 {total_steps}，当前 step={self.global_step}')
@@ -792,13 +830,14 @@ class HumanLRMTrainer(Runner):
             for batch in self.train_loader:
                 self.model.hyper_step(self.global_step)
 
-                should_log_imgs = (
-                    (self.global_step + 1) % img_period == 0
+                # 训练阶段只记录 loss/metrics，不记录图片（图片只在 _validate() 里记录）
+                should_log_scalars = (
+                    (self.global_step + 1) % log_interval == 0
                     and self.accelerator.is_main_process
                 )
-                step_result = self._train_step(batch, return_render_out=should_log_imgs)
+                step_result = self._train_step(batch, return_render_out=should_log_scalars)
 
-                if should_log_imgs:
+                if should_log_scalars:
                     losses, render_out, batch_dev = step_result
                 else:
                     losses = step_result
@@ -820,16 +859,11 @@ class HumanLRMTrainer(Runner):
                     scalar_metrics = dict(losses)
                     scalar_metrics['loss_total'] = total
                     scalar_metrics['lr'] = lr
+                    if render_out is not None:
+                        scalar_metrics.update(self._compute_eval_metrics(render_out, batch_dev))
                     self._log_scalars(scalar_metrics, 'train', self.global_step)
 
-                # 图像日志
-                if should_log_imgs and render_out is not None:
-                    self._log_images_wandb(
-                        render_out, batch, batch_dev,
-                        prefix='train', n_log=n_log,
-                    )
-
-                # 验证
+                # 验证（loss/metrics + 采样图片）
                 if self.global_step % val_period == 0:
                     self._validate()
 

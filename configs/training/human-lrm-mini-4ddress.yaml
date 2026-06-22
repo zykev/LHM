@@ -145,25 +145,26 @@ train:
   # 40GB GPU 可用 batch_size=2, accum_steps=2
   batch_size: 2
   accum_steps: 2
-  epochs: 60
+  # 10 个训练样本，batch_size=2 → 每 epoch 5 step。epochs=1000 → 总步数约 5000。
+  epochs: 1000
 
 # ----------------------------------------------------------
 # 验证
 # ----------------------------------------------------------
 val:
   batch_size: 1
-  global_step_period: 500
+  global_step_period: 200   # 每 200 步跑一次验证（原 500，配合更长的总步数调小，能更早看到曲线）
   debug_batches: 10
 
 # ----------------------------------------------------------
 # Checkpoint
 # ----------------------------------------------------------
 saver:
-  auto_resume: true
+  auto_resume: false
   load_model: null          # 从 scratch 训练设 null；fine-tune 填写 checkpoint 路径
-  checkpoint_root: ./exps/checkpoints
-  checkpoint_global_steps: 500
+  checkpoint_global_steps: 1000   # 每 1000 步存一次（原 500），存的次数减半
   checkpoint_keep_level: 20
+  # checkpoint 实际存到 <exps_root>/<wandb name>/checkpoints/ 下（见 logger.exps_root）
 
 # ----------------------------------------------------------
 # 日志
@@ -171,9 +172,11 @@ saver:
 logger:
   stream_level: WARNING
   log_level: INFO
-  log_root: ./exps/logs
-  tracker_root: ./exps/trackers
+  # 统一实验目录：exps_root/<wandb.name>/{logs,trackers,checkpoints,wandb}/
+  # logs/trackers/checkpoints/wandb 全部统一放在这一个目录下，不用单独配置各自的路径。
+  exps_root: ./exps
   enable_profiler: false
+  log_global_steps: 50      # 标量 loss / psnr / ssim / lpips 的记录间隔
   trackers:
     - tensorboard
     - wandb
@@ -188,7 +191,8 @@ logger:
     notes: ""
     run_id: null           # 设置 run id 可在中断后 resume 同一 run
   image_monitor:
-    train_global_steps: 500
+    # 训练阶段不记录图片，只在 _validate()（每 val.global_step_period 步）
+    # 采样图片记录到 wandb；这里只控制每次验证记录几个样本。
     samples_per_log: 2
 
 # ----------------------------------------------------------
