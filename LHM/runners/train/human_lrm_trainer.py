@@ -118,6 +118,7 @@ class HumanLRMTrainer(Runner):
     def __init__(self):
         super().__init__()
         self.cfg = self._load_config()
+        self._setup_compile()
         self._setup_accelerator()
         self._setup_logger()
         self._setup_model()
@@ -126,6 +127,15 @@ class HumanLRMTrainer(Runner):
         self._setup_losses()
         self.global_step = 0
         self._resume_if_needed()
+
+    def _setup_compile(self):
+        """将 cfg.compile 中的设置应用到 torch._dynamo（模型里的 @torch.compile
+        装饰器在类定义时即生效，必须在构建模型前设置这些全局开关才有效）。"""
+        cc = self.cfg.get('compile', {})
+        if cc.get('disable', False):
+            torch._dynamo.config.disable = True
+        if cc.get('suppress_errors', False):
+            torch._dynamo.config.suppress_errors = True
 
     def __enter__(self):
         return self
