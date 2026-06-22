@@ -886,6 +886,7 @@ class ModelHumanLRMSapdinoBodyHeadSD3_5(ModelHumanLRM):
         return x
 
     def forward(
+        self,
         image,
         source_c2ws,
         source_intrs,
