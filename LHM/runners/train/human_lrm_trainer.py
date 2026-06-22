@@ -57,7 +57,7 @@ def parse_dynamic_weight(spec, global_step: int) -> float:
     """
     if isinstance(spec, (int, float)):
         return float(spec)
-    if spec is None or spec < 0:
+    if spec is None:
         return 0.0
     parts = str(spec).split(':')
     if len(parts) == 1:
