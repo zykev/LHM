@@ -376,9 +376,12 @@ class ModelHumanLRM(nn.Module):
         ), "Batch size mismatch for image and smplx_params"
         assert len(smplx_params["betas"].shape) == 2
 
-        render_h, render_w = int(render_intrs[0, 0, 1, 2] * 2), int(
-            render_intrs[0, 0, 0, 2] * 2
-        )
+        if "render_height" in kwargs and kwargs["render_height"] is not None:
+            render_h, render_w = kwargs["render_height"], kwargs["render_width"]
+        else:
+            render_h, render_w = int(render_intrs[0, 0, 1, 2] * 2), int(
+                render_intrs[0, 0, 0, 2] * 2
+            )
         query_points = None
         if self.latent_query_points_type.startswith("e2e_smplx"):
             query_points, smplx_params = self.renderer.get_query_points(
@@ -926,9 +929,12 @@ class ModelHumanLRMSapdinoBodyHeadSD3_5(ModelHumanLRM):
         ), "Batch size mismatch for image and smplx_params"
         assert len(smplx_params["betas"].shape) == 2
 
-        render_h, render_w = int(render_intrs[0, 0, 1, 2] * 2), int(
-            render_intrs[0, 0, 0, 2] * 2
-        )
+        if "render_height" in kwargs and kwargs["render_height"] is not None:
+            render_h, render_w = kwargs["render_height"], kwargs["render_width"]
+        else:
+            render_h, render_w = int(render_intrs[0, 0, 1, 2] * 2), int(
+                render_intrs[0, 0, 0, 2] * 2
+            )
 
         query_points = None
         if self.latent_query_points_type.startswith("e2e_smplx"):

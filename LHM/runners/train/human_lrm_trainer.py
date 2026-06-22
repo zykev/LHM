@@ -556,10 +556,11 @@ class HumanLRMTrainer(Runner):
         lc = self.cfg.train.loss
         gs  = self.global_step
 
-        # 渲染输出 shape: comp_rgb [B, N_tgt, H, W, 3]（channels last）
-        # 转换为 [B, N_tgt, 3, H, W]（channel first）供损失函数使用
-        pred_rgb   = render_out['comp_rgb'].permute(0, 1, 4, 2, 3).contiguous()
-        pred_mask  = render_out['comp_mask'].permute(0, 1, 4, 2, 3).contiguous()  # [B, N, 1, H, W]
+        # GS3DRenderer.forward_animate_gs（gs_renderer.py）已经把 comp_rgb/comp_mask
+        # 从 [B, N_tgt, H, W, 3]（channels last）permute 成 [B, N_tgt, 3, H, W]（channel
+        # first）再返回，这里不需要再 permute 一次——否则会把 H/W 维度和 channel 维度搞混。
+        pred_rgb   = render_out['comp_rgb'].contiguous()
+        pred_mask  = render_out['comp_mask'].contiguous()  # [B, N, 1, H, W]
 
         gt_images = batch['render_images']   # [B, N, 3, H, W]
         gt_masks  = batch['render_masks']    # [B, N, 1, H, W]
@@ -658,6 +659,8 @@ class HumanLRMTrainer(Runner):
             smplx_params    = smplx_params,
             # kwargs
             source_head_rgbs= batch['source_head_rgbs'].to(device),
+            render_height   = batch['render_images'].shape[-2],
+            render_width    = batch['render_images'].shape[-1],
             df_data         = None,
         )
 

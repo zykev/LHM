@@ -70,7 +70,13 @@ def _crop_params(cam_info: dict) -> tuple:
 
 
 def _build_intrinsic_4x4(cam_info: dict, target_w: int) -> torch.Tensor:
-    """构建 crop+resize 后的 4×4 像素空间内参矩阵。"""
+    """构建 crop+resize 后的 4×4 像素空间内参矩阵。
+
+    LHM 的渲染器约定主点严格位于图像中心（参见 runners/infer/utils.py 中
+    intr[0,2]=W//2, intr[1,2]=H//2 的写法，渲染分辨率也由 princpt*2 反推），
+    而非使用真实标定的 cx,cy（标定主点几乎不会恰好居中，会导致渲染分辨率
+    与数据集实际分辨率不一致）。因此这里强制把主点设为目标分辨率中心。
+    """
     K = np.array(cam_info['intrinsics'])
     W_crop, H_crop, dx, dy = _crop_params(cam_info)
     target_h = int(target_w * ASPECT_HW)
@@ -78,8 +84,8 @@ def _build_intrinsic_4x4(cam_info: dict, target_w: int) -> torch.Tensor:
     mat = torch.eye(4, dtype=torch.float32)
     mat[0, 0] = K[0, 0] * sx
     mat[1, 1] = K[1, 1] * sy
-    mat[0, 2] = (K[0, 2] - dx) * sx
-    mat[1, 2] = (K[1, 2] - dy) * sy
+    mat[0, 2] = target_w / 2
+    mat[1, 2] = target_h / 2
     return mat
 
 
