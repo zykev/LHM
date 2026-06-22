@@ -620,17 +620,16 @@ class HumanLRMTrainer(Runner):
         w_ball = parse_dynamic_weight(lc.get('asap_weight', 0), gs)
         if w_ball > 0 and 'scaling_output' in render_out:
             # scaling_output: [B, N_pts, 3]（已 stack 自 gs_attrs_list）
+            # Heuristic_ASAP_Loss 内部按 group_body_mapping 在 N_pts 维度上索引，
+            # 必须保留 [B, N_pts, 3] 形状，不能把 B 和 N_pts 压平到一起。
             scaling = render_out['scaling_output']  # [B, N_pts, 3]
-            # Heuristic_ASAP_Loss 期望 [total_pts, 3] 形式
-            scaling_flat = scaling.reshape(-1, scaling.shape[-1])
-            losses['asap'] = w_ball * self.ball_loss(scaling_flat)
+            losses['asap'] = w_ball * self.ball_loss(scaling)
 
         # ACAP（offset）loss：控制 GS 偏移量
         w_off = parse_dynamic_weight(lc.get('acap_weight', 0), gs)
         if w_off > 0 and 'offset_output' in render_out:
             offset = render_out['offset_output']  # [B, N_pts, 3]
-            offset_flat = offset.reshape(-1, offset.shape[-1])
-            losses['acap'] = w_off * self.offset_loss(offset_flat)
+            losses['acap'] = w_off * self.offset_loss(offset)
 
         return losses
 
