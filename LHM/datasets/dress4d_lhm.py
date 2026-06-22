@@ -290,7 +290,7 @@ class Dress4DLHMDataset(BaseDataset):
                 with open(fp) as f:
                     flame_params = json.load(f)
 
-        return {
+        sample = {
             'src_images':       src_image,        # [1, 3, H_src, W_src]
             'source_head_rgbs': src_head_rgb,     # [1, 3, hs, hs]
             'render_images':    render_images,    # [N_tgt, 3, H, W]
@@ -301,7 +301,9 @@ class Dress4DLHMDataset(BaseDataset):
             'source_intrs':     source_intrs,     # [1, 4, 4]
             'render_bg_colors': render_bg_colors, # [N_tgt, 3]
             'smplx_params':     smplx_params,
-            'flame_params':     flame_params,
             'uid':              uid,
             'frame_idx':        frame_idx,
         }
+        if flame_params is not None:
+            sample['flame_params'] = flame_params
+        return sample
