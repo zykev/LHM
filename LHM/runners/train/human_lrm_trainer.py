@@ -423,11 +423,12 @@ class HumanLRMTrainer(Runner):
         n = min(n_log, B)
         N = render_out['comp_rgb'].shape[1]  # N_tgt views
 
-        # comp_rgb: [B, N, H, W, 3] → [B, N, 3, H, W]
-        pred_rgb  = render_out['comp_rgb'][:n].detach().float().permute(0, 1, 4, 2, 3).clamp(0, 1)
-        # comp_mask: [B, N, H, W, 1] → [B, N, 1, H, W] → expand to 3 channels
+        # comp_rgb/comp_mask 在 gs_renderer.py 的 forward_animate_gs 里已经从
+        # [B, N, H, W, 3]（channels last）permute 成 [B, N, 3/1, H, W]（channel first）
+        # 再返回，这里不需要再 permute 一次。
+        pred_rgb  = render_out['comp_rgb'][:n].detach().float().clamp(0, 1)
         pred_mask = (
-            render_out['comp_mask'][:n].detach().float().permute(0, 1, 4, 2, 3).clamp(0, 1)
+            render_out['comp_mask'][:n].detach().float().clamp(0, 1)
             .expand(-1, -1, 3, -1, -1)
         )
         gt_images = batch_dev['render_images'][:n].detach().float().clamp(0, 1)
@@ -473,7 +474,8 @@ class HumanLRMTrainer(Runner):
                 matplotlib.use('Agg')
                 import matplotlib.pyplot as plt
                 import numpy as np
-                depth = render_out['comp_depth'][:n, :, :, :, 0].detach().float().cpu()  # [n, N, H, W]
+                # comp_depth 是 [B, N, 1, H, W]（channel first，同 comp_rgb/comp_mask）
+                depth = render_out['comp_depth'][:n, :, 0, :, :].detach().float().cpu()  # [n, N, H, W]
                 depth_flat = depth.reshape(n * N, *depth.shape[2:])  # [n*N, H, W]
                 # Normalize per-sample
                 d_min, d_max = depth_flat.amin(dim=(1,2), keepdim=True), depth_flat.amax(dim=(1,2), keepdim=True)
