@@ -283,6 +283,11 @@ class Dress4DLHMDataset(BaseDataset):
         render_images = torch.stack(render_images)  # [N_tgt, 3, H, W]
         render_masks  = torch.stack(render_masks)   # [N_tgt, 1, H, W]
 
+        # GS3DRenderer 渲染时背景统一合成成纯白（render_bg_colors=ones），但这里
+        # render_images 加载的是真实拍摄照片，背景是真实场景，跟渲染背景天然不一致。
+        # 用 mask 把 GT 背景也替换成纯白，和渲染器约定保持一致。
+        render_images = render_images * render_masks + (1.0 - render_masks)
+
         src_head_rgb = self._crop_head(src_img_path, prepared_dir, frame_idx).unsqueeze(0)
 
         flame_params = None
