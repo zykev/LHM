@@ -666,10 +666,12 @@ class HumanLRMTrainer(Runner):
         """
         计算 PSNR / SSIM / LPIPS 评估指标（不加权、不参与反向传播，只用于监控）。
 
-        PSNR/SSIM 只在 mask 覆盖的前景区域内计算（逐像素/局部窗口操作，裁不裁
-        bounding box 结果完全一样，没必要裁）。LPIPS 是整张图过网络提特征，如果
-        人体在画面里占比很小，大片背景会稀释掉网络对主体的"有效分辨率"，所以单独
-        对 LPIPS 按 mask 的 bounding box 裁剪后再算，让网络看到的主体占比更大。
+        逐视角裁到 mask 的 bounding box 再调 kornia/lpips 的库函数算（不同视角
+        bbox 大小不同，没法整 batch 向量化，只能逐个算）。框内仍乘 mask，避免
+        bbox 内人体凹陷处的背景缝隙混进比较；kornia 的 psnr/ssim 不支持传 mask，
+        只能对传入的整个 tensor 无差别求平均，所以这些缝隙（两边都被置零）会被
+        当成"完美匹配"计入平均，带来一点偏差——但范围只局限在 bbox 内部的小块
+        区域，比之前"整张图背景免费拿满分"的量级小得多。
         """
         pred_rgb  = render_out['comp_rgb'].contiguous().float().clamp(0, 1)
         gt_images = batch['render_images'].float().clamp(0, 1)
@@ -679,44 +681,34 @@ class HumanLRMTrainer(Runner):
         pred_flat = pred_rgb.reshape(B * N, C, H, W)
         gt_flat   = gt_images.reshape(B * N, C, H, W)
         mask_flat = gt_masks.reshape(B * N, 1, H, W)
-        mask_c    = mask_flat.expand(-1, C, -1, -1)
-        n_mask_px = mask_c.sum().clamp(min=1.0)
 
-        # masked PSNR：只在 mask 覆盖的像素上算 MSE
-        mse = ((pred_flat - gt_flat) ** 2 * mask_c).sum() / n_mask_px
-        psnr_val = -10.0 * torch.log10(mse.clamp(min=1e-10))
-
-        # masked SSIM：kornia 返回逐像素 SSIM map（不会自动 reduce），只在 mask
-        # 区域内取加权平均，而不是对整张图（含背景）做 .mean()。
-        ssim_map = kornia_metrics.ssim(pred_flat, gt_flat, window_size=11, max_val=1.0)
-        ssim_val = (ssim_map * mask_c).sum() / n_mask_px
-
-        # LPIPS：逐视角裁到 mask 的 bounding box（不同视角 bbox 大小不同，没法整
-        # batch 向量化裁剪，只能逐个算），框内仍乘 mask 避免背景噪声。
-        lpips_vals = []
+        psnr_vals, ssim_vals, lpips_vals = [], [], []
         for i in range(pred_flat.shape[0]):
             coords = torch.nonzero(mask_flat[i, 0] > 0, as_tuple=False)
             if coords.numel() == 0:
-                crop_pred, crop_gt = pred_flat[i], gt_flat[i] * 0
+                crop_pred = (pred_flat[i] * 0).unsqueeze(0)
+                crop_gt   = (gt_flat[i] * 0).unsqueeze(0)
             else:
                 y0, x0 = coords.min(dim=0)[0]
                 y1, x1 = coords.max(dim=0)[0]
-                crop_mask = mask_c[i, :, y0:y1 + 1, x0:x1 + 1]
-                crop_pred = pred_flat[i, :, y0:y1 + 1, x0:x1 + 1] * crop_mask
-                crop_gt   = gt_flat[i, :, y0:y1 + 1, x0:x1 + 1] * crop_mask
+                crop_mask = mask_flat[i, :, y0:y1 + 1, x0:x1 + 1].expand(C, -1, -1)
+                crop_pred = (pred_flat[i, :, y0:y1 + 1, x0:x1 + 1] * crop_mask).unsqueeze(0)
+                crop_gt   = (gt_flat[i, :, y0:y1 + 1, x0:x1 + 1] * crop_mask).unsqueeze(0)
+
+            psnr_vals.append(kornia_metrics.psnr(crop_pred, crop_gt, max_val=1.0))
+            ssim_vals.append(
+                kornia_metrics.ssim(crop_pred, crop_gt, window_size=11, max_val=1.0).mean()
+            )
             lpips_vals.append(
                 self.perceptual_loss(
-                    crop_pred.unsqueeze(0).unsqueeze(0),
-                    crop_gt.unsqueeze(0).unsqueeze(0),
-                    is_training=False,
+                    crop_pred.unsqueeze(1), crop_gt.unsqueeze(1), is_training=False
                 )
             )
-        lpips_val = torch.stack(lpips_vals).mean()
 
         return {
-            'psnr':  psnr_val.item(),
-            'ssim':  ssim_val.item(),
-            'lpips': lpips_val.item(),
+            'psnr':  torch.stack(psnr_vals).mean().item(),
+            'ssim':  torch.stack(ssim_vals).mean().item(),
+            'lpips': torch.stack(lpips_vals).mean().item(),
         }
 
     # ── 单步训练 ─────────────────────────────────────────────────────────────
