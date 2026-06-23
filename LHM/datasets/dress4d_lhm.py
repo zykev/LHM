@@ -59,10 +59,20 @@ def _resize_keepaspect(img: np.ndarray, max_tgt_size: int):
     return cv2.resize(img, (new_w, new_h), interpolation=interp), ratio
 
 
-def _center_crop_by_mask(img: np.ndarray, mask: np.ndarray, aspect_standard: float,
-                          enlarge_ratio=(1.0, 1.0)):
-    """以图像几何中心为基准，裁出"刚好包住整个 mask、且满足目标纵横比"的区域，
-    裁剪框只会被撑大以满足纵横比，不会缩小到比 mask 包围盒还小——保证不裁到人。
+def _center_crop_by_mask(img: np.ndarray, mask: np.ndarray, cx: float, cy: float,
+                          aspect_standard: float, enlarge_ratio=(1.0, 1.0)):
+    """以相机真实光轴位置 (cx, cy) 为基准（不是图像几何中心！），裁出"刚好包住
+    整个 mask、且满足目标纵横比"的区域，裁剪框只会被撑大以满足纵横比，不会缩小
+    到比 mask 包围盒还小——保证不裁到人。
+
+    GS3DRenderer 的投影矩阵（getProjectionMatrix/intrinsic_to_fov）是完全对称的
+    视锥，只用 fx,fy 算 FoV，根本不读 cx,cy，也就是说渲染器只能正确渲染"光轴正
+    好在画面中心"的相机。如果围绕图像几何中心裁剪，再在 _load_view 里把 cx,cy
+    强制设成新图像中心，等于无视了真实标定的 cx,cy 跟几何中心之间的差异，凭空
+    引入一个恒定的像素偏移（4DDress 真实相机的 cx,cy 并不在图像几何中心）。围绕
+    真实 cx,cy 裁剪，才能保证裁完之后真实光轴恰好落在新图像中心，让后面"强制
+    居中"是一个几乎无误差的精确陈述，而不是引入偏移。
+
     返回 (cropped_img, cropped_mask, offset_x, offset_y)。
     """
     ys, xs = np.where(mask > 0)
@@ -72,10 +82,10 @@ def _center_crop_by_mask(img: np.ndarray, mask: np.ndarray, aspect_standard: flo
         return img, mask, 0, 0
 
     x_min, x_max, y_min, y_max = xs.min(), xs.max(), ys.min(), ys.max()
-    center_x, center_y = W // 2, H // 2
+    cx_i, cy_i = int(round(cx)), int(round(cy))
 
-    half_w = max(abs(center_x - x_min), abs(center_x - x_max))
-    half_h = max(abs(center_y - y_min), abs(center_y - y_max))
+    half_w = max(abs(cx_i - x_min), abs(cx_i - x_max))
+    half_h = max(abs(cy_i - y_min), abs(cy_i - y_max))
     half_w_raw, half_h_raw = half_w, half_h
     aspect = half_h / max(half_w, 1)
 
@@ -84,27 +94,29 @@ def _center_crop_by_mask(img: np.ndarray, mask: np.ndarray, aspect_standard: flo
     else:
         half_h = round(half_w * aspect_standard)
 
-    # 不超出原图边界：退回未按纵横比调整的原始值
-    if half_h > center_y:
+    # 不超出原图边界：注意 cx,cy 不在几何中心，左右/上下可用空间不对称
+    max_half_w = min(cx_i, W - cx_i)
+    max_half_h = min(cy_i, H - cy_i)
+    if half_h > max_half_h:
         half_w = round(half_h_raw / aspect_standard)
         half_h = half_h_raw
-    if half_w > center_x:
+    if half_w > max_half_w:
         half_h = round(half_w_raw * aspect_standard)
         half_w = half_w_raw
 
     if abs(enlarge_ratio[0] - 1) > 0.01 or abs(enlarge_ratio[1] - 1) > 0.01:
         enlarge_min, enlarge_max = enlarge_ratio
-        enlarge_max_real = min(center_y / max(half_h, 1), center_x / max(half_w, 1))
+        enlarge_max_real = min(max_half_h / max(half_h, 1), max_half_w / max(half_w, 1))
         enlarge_max = min(enlarge_max_real, enlarge_max)
         enlarge_min = min(enlarge_max_real, enlarge_min)
         cur = np.random.rand() * (enlarge_max - enlarge_min) + enlarge_min
         half_h, half_w = round(cur * half_h), round(cur * half_w)
 
-    half_h = min(half_h, center_y)
-    half_w = min(half_w, center_x)
+    half_h = min(half_h, max_half_h)
+    half_w = min(half_w, max_half_w)
 
-    offset_x = center_x - half_w
-    offset_y = center_y - half_h
+    offset_x = cx_i - half_w
+    offset_y = cy_i - half_h
     cropped_img  = img[offset_y:offset_y + 2 * half_h, offset_x:offset_x + 2 * half_w]
     cropped_mask = mask[offset_y:offset_y + 2 * half_h, offset_x:offset_x + 2 * half_w]
     return cropped_img, cropped_mask, offset_x, offset_y
@@ -159,8 +171,11 @@ def _load_view(img_path: str, mask_path: str, K_raw: np.ndarray, target_w: int,
     K[0, 0] *= ratio0; K[0, 2] *= ratio0
     K[1, 1] *= ratio0; K[1, 2] *= ratio0
 
-    # 2) 用 mask 包围盒裁剪，保证不裁到人
-    img, mask, off_x, off_y = _center_crop_by_mask(img, mask, aspect_standard, enlarge_ratio)
+    # 2) 用 mask 包围盒裁剪，保证不裁到人；围绕相机真实光轴 (K[0,2],K[1,2])，
+    # 不是图像几何中心（见 _center_crop_by_mask 注释）
+    img, mask, off_x, off_y = _center_crop_by_mask(
+        img, mask, K[0, 2], K[1, 2], aspect_standard, enlarge_ratio
+    )
     K[0, 2] -= off_x
     K[1, 2] -= off_y
 
