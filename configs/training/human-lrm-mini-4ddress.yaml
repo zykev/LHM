@@ -82,7 +82,7 @@ dataset:
   sample_side_views: 4
 
   # 原始 4DDress 数据路径（Dataset 直接从此处读取各视角图像）
-  raw_data_dir: ".datasets/4ddress"
+  raw_data_dir: ".datasets/4ddress1"
 
   source_image_res: 512
   render_image:
@@ -165,7 +165,7 @@ val:
 saver:
   auto_resume: false
   load_model: null          # 从 scratch 训练设 null；fine-tune 填写 checkpoint 路径
-  checkpoint_global_steps: 1000   # 每 1000 步存一次（原 500），存的次数减半
+  checkpoint_global_steps: 2000   # 每 1000 步存一次（原 500），存的次数减半
   checkpoint_keep_level: 20
   # checkpoint 实际存到 <exps_root>/<wandb name>/checkpoints/ 下（见 logger.exps_root）
 
@@ -181,7 +181,7 @@ logger:
   enable_profiler: false
   log_global_steps: 50      # 标量 loss / psnr / ssim / lpips 的记录间隔
   trackers:
-    - tensorboard
+    # - tensorboard
     - wandb
   wandb:
     entity: "zyprojects"             # 你的 wandb entity（用户名或团队名）；留空使用默认

@@ -69,3 +69,4 @@ lhm_cuda_dockers/
 gfpgan/
 
 *tar
+slurm*
