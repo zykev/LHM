@@ -311,7 +311,8 @@ class HumanLRMTrainer(Runner):
         dataset_kwargs.pop('num_val_workers', None)
         dataset_kwargs.pop('pin_mem', None)
         dataset_kwargs.pop('repeat_num', None)
-        dataset_kwargs.pop('multiply', None)
+        # multiply 不再 pop 掉——Dress4DLHMDataset 现在要用它把最终图像尺寸
+        # 对齐到 multiply 的整数倍（跟 ViT patch size 对齐，见 _calc_tgt_hw）。
 
         subsets = OmegaConf.to_container(dc.subsets, resolve=True)
 

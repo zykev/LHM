@@ -31,64 +31,6 @@ ASPECT_HW = 5.0 / 3.0  # LHM 期望的高:宽
 # 图像/内参工具
 # ---------------------------------------------------------------------------
 
-def _load_image(path: str, target_w: int,
-                crop_dx: int, crop_dy: int, crop_w: int, crop_h: int) -> torch.Tensor:
-    """读取 BGR 图像，center-crop，resize 到 (target_w, target_w*ASPECT_HW)，返回 [3,H,W] float32。"""
-    target_h = int(target_w * ASPECT_HW)
-    img = cv2.imread(path)
-    if img is None:
-        return torch.zeros(3, target_h, target_w, dtype=torch.float32)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)[crop_dy:crop_dy + crop_h, crop_dx:crop_dx + crop_w]
-    img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
-    return torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
-
-
-def _load_mask(path: str, target_w: int,
-               crop_dx: int, crop_dy: int, crop_w: int, crop_h: int) -> torch.Tensor:
-    """读取 mask，返回 [1,H,W] float32；文件不存在时返回全 1（全前景）。"""
-    target_h = int(target_w * ASPECT_HW)
-    if not os.path.exists(path):
-        return torch.ones(1, target_h, target_w, dtype=torch.float32)
-    mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    if mask is None:
-        return torch.ones(1, target_h, target_w, dtype=torch.float32)
-    mask = mask[crop_dy:crop_dy + crop_h, crop_dx:crop_dx + crop_w]
-    mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-    return torch.from_numpy((mask > 127).astype(np.float32)).unsqueeze(0)
-
-
-def _crop_params(cam_info: dict) -> tuple:
-    """由 cameras.json 相机信息计算 5:3 center-crop 参数，返回 (W_crop, H_crop, dx, dy)。"""
-    W, H = cam_info['img_wh']
-    if H / W > ASPECT_HW:
-        H_crop = int(W * ASPECT_HW)
-        return W, H_crop, 0, (H - H_crop) // 2
-    elif H / W < ASPECT_HW:
-        W_crop = int(H / ASPECT_HW)
-        return W_crop, H, (W - W_crop) // 2, 0
-    return W, H, 0, 0
-
-
-def _build_intrinsic_4x4(cam_info: dict, target_w: int) -> torch.Tensor:
-    """构建 crop+resize 后的 4×4 像素空间内参矩阵。
-
-    LHM 的渲染器约定主点严格位于图像中心（参见 runners/infer/utils.py 中
-    intr[0,2]=W//2, intr[1,2]=H//2 的写法，渲染分辨率也由 princpt*2 反推），
-    而非使用真实标定的 cx,cy（标定主点几乎不会恰好居中，会导致渲染分辨率
-    与数据集实际分辨率不一致）。因此这里强制把主点设为目标分辨率中心。
-    """
-    K = np.array(cam_info['intrinsics'])
-    W_crop, H_crop, dx, dy = _crop_params(cam_info)
-    target_h = int(target_w * ASPECT_HW)
-    sx, sy = target_w / W_crop, target_h / H_crop
-    mat = torch.eye(4, dtype=torch.float32)
-    mat[0, 0] = K[0, 0] * sx
-    mat[1, 1] = K[1, 1] * sy
-    mat[0, 2] = target_w / 2
-    mat[1, 2] = target_h / 2
-    return mat
-
-
 def _find_capture_file(cam_raw_dir: str, frame_idx: int, subdir: str) -> str:
     """构造 4DDress Capture/{cam}/{subdir} 下的文件路径。
     命名规则：images/capture-f{frame:05d}.png，masks/mask-f{frame:05d}.png。
@@ -96,6 +38,150 @@ def _find_capture_file(cam_raw_dir: str, frame_idx: int, subdir: str) -> str:
     prefix = 'capture' if subdir == 'images' else 'mask'
     path = os.path.join(cam_raw_dir, subdir, f'{prefix}-f{frame_idx:05d}.png')
     return path if os.path.exists(path) else ''
+
+
+# ---------------------------------------------------------------------------
+# 跟 LHM 官方 runners/infer/utils.py:preprocess_image 对齐的预处理流程
+# （resize_image_keepaspect_np / center_crop_according_to_mask /
+#  calc_new_tgt_size_by_aspect 的训练数据版本，逐帧用真实 mask 动态裁剪，
+#  而不是像旧版 _crop_params 那样只按相机的静态分辨率做几何中心裁剪）
+# ---------------------------------------------------------------------------
+
+MAX_TGT_SIZE = 896  # 与官方 human_lrm.py 里硬编码的 max_tgt_size 保持一致
+
+
+def _resize_keepaspect(img: np.ndarray, max_tgt_size: int):
+    """按最长边等比缩放到 max_tgt_size，返回 (resized_img, ratio)。"""
+    h, w = img.shape[:2]
+    ratio = max_tgt_size / max(h, w)
+    new_h, new_w = round(h * ratio), round(w * ratio)
+    interp = cv2.INTER_AREA if ratio < 1 else cv2.INTER_LINEAR
+    return cv2.resize(img, (new_w, new_h), interpolation=interp), ratio
+
+
+def _center_crop_by_mask(img: np.ndarray, mask: np.ndarray, aspect_standard: float,
+                          enlarge_ratio=(1.0, 1.0)):
+    """以图像几何中心为基准，裁出"刚好包住整个 mask、且满足目标纵横比"的区域，
+    裁剪框只会被撑大以满足纵横比，不会缩小到比 mask 包围盒还小——保证不裁到人。
+    返回 (cropped_img, cropped_mask, offset_x, offset_y)。
+    """
+    ys, xs = np.where(mask > 0)
+    H, W = img.shape[:2]
+    if len(xs) == 0 or len(ys) == 0:
+        # 没有有效前景区域，没法用 mask 定位，退化成保留原图（不裁剪）
+        return img, mask, 0, 0
+
+    x_min, x_max, y_min, y_max = xs.min(), xs.max(), ys.min(), ys.max()
+    center_x, center_y = W // 2, H // 2
+
+    half_w = max(abs(center_x - x_min), abs(center_x - x_max))
+    half_h = max(abs(center_y - y_min), abs(center_y - y_max))
+    half_w_raw, half_h_raw = half_w, half_h
+    aspect = half_h / max(half_w, 1)
+
+    if aspect >= aspect_standard:
+        half_w = round(half_h / aspect_standard)
+    else:
+        half_h = round(half_w * aspect_standard)
+
+    # 不超出原图边界：退回未按纵横比调整的原始值
+    if half_h > center_y:
+        half_w = round(half_h_raw / aspect_standard)
+        half_h = half_h_raw
+    if half_w > center_x:
+        half_h = round(half_w_raw * aspect_standard)
+        half_w = half_w_raw
+
+    if abs(enlarge_ratio[0] - 1) > 0.01 or abs(enlarge_ratio[1] - 1) > 0.01:
+        enlarge_min, enlarge_max = enlarge_ratio
+        enlarge_max_real = min(center_y / max(half_h, 1), center_x / max(half_w, 1))
+        enlarge_max = min(enlarge_max_real, enlarge_max)
+        enlarge_min = min(enlarge_max_real, enlarge_min)
+        cur = np.random.rand() * (enlarge_max - enlarge_min) + enlarge_min
+        half_h, half_w = round(cur * half_h), round(cur * half_w)
+
+    half_h = min(half_h, center_y)
+    half_w = min(half_w, center_x)
+
+    offset_x = center_x - half_w
+    offset_y = center_y - half_h
+    cropped_img  = img[offset_y:offset_y + 2 * half_h, offset_x:offset_x + 2 * half_w]
+    cropped_mask = mask[offset_y:offset_y + 2 * half_h, offset_x:offset_x + 2 * half_w]
+    return cropped_img, cropped_mask, offset_x, offset_y
+
+
+def _calc_tgt_hw(aspect_standard: float, tgt_w: int, multiply: int):
+    """目标 (H, W)：H = tgt_w * aspect_standard，两边都向下取整到 multiply 的
+    整数倍（跟 ViT patch size 对齐，避免 patch embedding 卷积在边缘截断）。"""
+    tgt_h = tgt_w * aspect_standard
+    tgt_h = max(int(tgt_h / multiply) * multiply, multiply)
+    tgt_w = max(int(tgt_w / multiply) * multiply, multiply)
+    return tgt_h, tgt_w
+
+
+def _load_view(img_path: str, mask_path: str, K_raw: np.ndarray, target_w: int,
+               multiply: int, aspect_standard: float = ASPECT_HW,
+               max_tgt_size: int = MAX_TGT_SIZE, enlarge_ratio=(1.0, 1.0)):
+    """完整复刻 LHM 官方 preprocess_image 的预处理流程：
+    1. 读图 + mask，背景合成纯白（跟渲染器 render_bg_colors 一致）
+    2. 按最长边等比缩放到 max_tgt_size，统一不同原始分辨率下人物的像素尺度
+    3. 用 mask 包围盒、围绕图像几何中心裁出恰好包住人、满足目标纵横比的区域
+       （旧版 _crop_params 只按相机的静态分辨率裁固定窗口，不看人在画面里的
+       实际位置/姿态，可能裁到人；这里跟官方一样动态保证不裁到人）
+    4. resize 到最终输出尺寸（取整到 multiply 的整数倍）
+    5. 相机内参跟每一步同步变换，最终强制主点居中（此时已非常接近图像中心，
+       跟官方在 utils.py 里的断言一致，强制居中不会引入明显误差）
+    返回 (img_tensor[3,H,W], mask_tensor[1,H,W], intr_4x4)。
+    """
+    tgt_h, tgt_w = _calc_tgt_hw(aspect_standard, target_w, multiply)
+
+    img_bgr = cv2.imread(img_path) if img_path else None
+    if img_bgr is None:
+        img_t  = torch.ones(3, tgt_h, tgt_w, dtype=torch.float32)
+        mask_t = torch.zeros(1, tgt_h, tgt_w, dtype=torch.float32)
+        intr = torch.eye(4, dtype=torch.float32)
+        intr[0, 2], intr[1, 2] = tgt_w / 2, tgt_h / 2
+        return img_t, mask_t, intr
+
+    mask_gray = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE) if mask_path else None
+    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    mask = (mask_gray > 127).astype(np.float32) if mask_gray is not None \
+        else np.ones(img.shape[:2], dtype=np.float32)
+
+    # 背景合成纯白
+    img = img * mask[:, :, None] + 1.0 * (1 - mask[:, :, None])
+
+    K = K_raw.astype(np.float64).copy()
+
+    # 1) 按最长边缩放到 max_tgt_size
+    img, ratio0 = _resize_keepaspect(img, max_tgt_size)
+    mask, _     = _resize_keepaspect(mask, max_tgt_size)
+    K[0, 0] *= ratio0; K[0, 2] *= ratio0
+    K[1, 1] *= ratio0; K[1, 2] *= ratio0
+
+    # 2) 用 mask 包围盒裁剪，保证不裁到人
+    img, mask, off_x, off_y = _center_crop_by_mask(img, mask, aspect_standard, enlarge_ratio)
+    K[0, 2] -= off_x
+    K[1, 2] -= off_y
+
+    # 3) resize 到最终目标尺寸
+    cur_h, cur_w = img.shape[:2]
+    ratio_y, ratio_x = tgt_h / cur_h, tgt_w / cur_w
+    img  = cv2.resize(img,  (tgt_w, tgt_h), interpolation=cv2.INTER_AREA)
+    mask = cv2.resize(mask, (tgt_w, tgt_h), interpolation=cv2.INTER_NEAREST)
+    K[0, 0] *= ratio_x; K[0, 2] *= ratio_x
+    K[1, 1] *= ratio_y; K[1, 2] *= ratio_y
+
+    # 4) 强制主点居中
+    intr = torch.eye(4, dtype=torch.float32)
+    intr[0, 0] = float(K[0, 0])
+    intr[1, 1] = float(K[1, 1])
+    intr[0, 2] = tgt_w / 2
+    intr[1, 2] = tgt_h / 2
+
+    img_t  = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1)
+    mask_t = torch.from_numpy((mask > 0.5).astype(np.float32)).unsqueeze(0)
+    return img_t, mask_t, intr
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +204,9 @@ class Dress4DLHMDataset(BaseDataset):
         sample_side_views: 目标视角数，最多 3
         use_flame:         是否加载 FLAME 参数
         src_head_size:     head crop 边长，默认 112
+        multiply:          最终图像尺寸向下取整到的倍数，跟 ViT patch size 对齐
+        max_tgt_size:      预裁剪前的最长边缩放尺寸，对齐官方 preprocess_image
+        enlarge_ratio:      mask 裁剪框的随机放大范围，[1.0, 1.0] 即不做增强
     """
 
     def __init__(
@@ -130,14 +219,20 @@ class Dress4DLHMDataset(BaseDataset):
         sample_side_views: int = 3,
         use_flame: bool = False,
         src_head_size: int = 112,
+        multiply: int = 16,
+        max_tgt_size: int = MAX_TGT_SIZE,
+        enlarge_ratio=(1.0, 1.0),
         **kwargs,
     ):
         super().__init__(root_dirs, meta_path)
         self.root_dirs        = [root_dirs] if isinstance(root_dirs, str) else list(root_dirs)
         self.raw_data_dir     = raw_data_dir
         self.source_image_res = source_image_res
-        self.render_image_res = (render_image or {}).get('low', 384)
+        self.render_image_res = (render_image or {}).get('high', (render_image or {}).get('low', 384))
         self.sample_side_views = sample_side_views
+        self.multiply          = multiply
+        self.max_tgt_size       = max_tgt_size
+        self.enlarge_ratio      = tuple(enlarge_ratio)
         self.use_flame        = use_flame
         self.src_head_size    = src_head_size
 
@@ -233,60 +328,56 @@ class Dress4DLHMDataset(BaseDataset):
             'betas':      betas,
         }
 
-        # --- 相机：相对 c2w + 内参 ---
+        # --- 相机外参（相对 c2w）---
         c2w_src = np.array(src_cam['c2w'], dtype=np.float64)
         w2c_src = np.linalg.inv(c2w_src)
-
-        render_c2ws, render_intrs = [], []
-        for cid in tgt_cam_ids:
-            c2w_tgt = np.array(cameras[cid]['c2w'], dtype=np.float64)
-            render_c2ws.append(torch.tensor(w2c_src @ c2w_tgt, dtype=torch.float32))
-            render_intrs.append(_build_intrinsic_4x4(cameras[cid], self.render_image_res))
-
-        render_c2ws  = torch.stack(render_c2ws)   # [N_tgt, 4, 4]
-        render_intrs = torch.stack(render_intrs)  # [N_tgt, 4, 4]
-        source_c2ws  = torch.eye(4).unsqueeze(0)  # [1, 4, 4]
-        source_intrs = _build_intrinsic_4x4(src_cam, self.source_image_res).unsqueeze(0)
+        render_c2ws = torch.stack([
+            torch.tensor(w2c_src @ np.array(cameras[cid]['c2w'], dtype=np.float64), dtype=torch.float32)
+            for cid in tgt_cam_ids
+        ])  # [N_tgt, 4, 4]
+        source_c2ws = torch.eye(4).unsqueeze(0)  # [1, 4, 4]
 
         render_bg_colors = torch.ones(N_tgt, 3)
 
-        # --- 图像 ---
-        src_cp = _crop_params(src_cam)  # (W_crop, H_crop, dx, dy)
-
+        # --- 图像 + mask + 内参：逐帧用 _load_view 动态裁剪（见函数注释），
+        # 内参由裁剪/缩放过程同步算出，不能像旧版那样跟图像加载分开算 ---
         if self.raw_data_dir:
             raw_item = self._raw_item_dir(uid)
-            src_cam_raw = os.path.join(raw_item, 'Capture', src_cam_id)
-            src_img_path = _find_capture_file(src_cam_raw, frame_idx, 'images')
+            src_cam_raw  = os.path.join(raw_item, 'Capture', src_cam_id)
+            src_img_path  = _find_capture_file(src_cam_raw, frame_idx, 'images')
+            src_mask_path = _find_capture_file(src_cam_raw, frame_idx, 'masks')
         else:
-            src_img_path = os.path.join(prepared_dir, 'imgs_png', f'{frame_idx:05d}.png')
+            src_img_path  = os.path.join(prepared_dir, 'imgs_png', f'{frame_idx:05d}.png')
+            src_mask_path = ''
 
-        src_image = _load_image(
-            src_img_path, self.source_image_res, src_cp[2], src_cp[3], src_cp[0], src_cp[1]
-        ).unsqueeze(0)  # [1, 3, H_src, W_src]
+        src_image, _src_mask, source_intr = _load_view(
+            src_img_path, src_mask_path, np.array(src_cam['intrinsics']),
+            self.source_image_res, self.multiply,
+            max_tgt_size=self.max_tgt_size, enlarge_ratio=self.enlarge_ratio,
+        )
+        src_image    = src_image.unsqueeze(0)     # [1, 3, H_src, W_src]
+        source_intrs = source_intr.unsqueeze(0)   # [1, 4, 4]
 
-        render_images, render_masks = [], []
+        render_images, render_masks, render_intrs = [], [], []
         for cid in tgt_cam_ids:
-            tgt_cp = _crop_params(cameras[cid])
             if self.raw_data_dir:
-                tgt_cam_raw  = os.path.join(raw_item, 'Capture', cid)
+                tgt_cam_raw   = os.path.join(raw_item, 'Capture', cid)
                 tgt_img_path  = _find_capture_file(tgt_cam_raw, frame_idx, 'images')
                 tgt_mask_path = _find_capture_file(tgt_cam_raw, frame_idx, 'masks')
-                render_images.append(_load_image(
-                    tgt_img_path, self.render_image_res, tgt_cp[2], tgt_cp[3], tgt_cp[0], tgt_cp[1]))
-                render_masks.append(_load_mask(
-                    tgt_mask_path, self.render_image_res, tgt_cp[2], tgt_cp[3], tgt_cp[0], tgt_cp[1]))
             else:
-                H_r = int(self.render_image_res * ASPECT_HW)
-                render_images.append(torch.zeros(3, H_r, self.render_image_res))
-                render_masks.append(torch.ones(1, H_r, self.render_image_res))
+                tgt_img_path, tgt_mask_path = '', ''
+            img, mask, intr = _load_view(
+                tgt_img_path, tgt_mask_path, np.array(cameras[cid]['intrinsics']),
+                self.render_image_res, self.multiply,
+                max_tgt_size=self.max_tgt_size, enlarge_ratio=self.enlarge_ratio,
+            )
+            render_images.append(img)
+            render_masks.append(mask)
+            render_intrs.append(intr)
 
         render_images = torch.stack(render_images)  # [N_tgt, 3, H, W]
         render_masks  = torch.stack(render_masks)   # [N_tgt, 1, H, W]
-
-        # GS3DRenderer 渲染时背景统一合成成纯白（render_bg_colors=ones），但这里
-        # render_images 加载的是真实拍摄照片，背景是真实场景，跟渲染背景天然不一致。
-        # 用 mask 把 GT 背景也替换成纯白，和渲染器约定保持一致。
-        render_images = render_images * render_masks + (1.0 - render_masks)
+        render_intrs  = torch.stack(render_intrs)   # [N_tgt, 4, 4]
 
         src_head_rgb = self._crop_head(src_img_path, prepared_dir, frame_idx).unsqueeze(0)
 
