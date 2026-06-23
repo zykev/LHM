@@ -30,7 +30,7 @@ from accelerate.utils import set_seed
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchvision.utils import make_grid
+from torchvision.utils import make_grid, save_image
 
 try:
     import wandb
@@ -415,8 +415,9 @@ class HumanLRMTrainer(Runner):
         prefix: str = 'train',
         n_log: int = 2,
     ):
-        """Log GT/rendered/mask/source images to wandb as image grids."""
-        if not self.accelerator.is_main_process or not getattr(self, 'use_wandb', False):
+        """记录采样图片：wandb（若启用）+ 本地保存一份到
+        exp_dir/images/<prefix>/step_<global_step>/ 下。"""
+        if not self.accelerator.is_main_process:
             return
 
         B = render_out['comp_rgb'].shape[0]
@@ -438,34 +439,23 @@ class HumanLRMTrainer(Runner):
         pred_mask_flat = pred_mask.reshape(n * N, *pred_mask.shape[2:])
         gt_flat        = gt_images.reshape(n * N, *gt_images.shape[2:])
 
-        imgs_log = {
-            f'{prefix}/render_rgb':  wandb.Image(
-                make_grid(pred_rgb_flat.cpu(), nrow=N, padding=2),
-                caption='rendered RGB',
-            ),
-            f'{prefix}/render_mask': wandb.Image(
-                make_grid(pred_mask_flat.cpu(), nrow=N, padding=2),
-                caption='rendered opacity/mask',
-            ),
-            f'{prefix}/gt_images':   wandb.Image(
-                make_grid(gt_flat.cpu(), nrow=N, padding=2),
-                caption='GT target views',
-            ),
+        # name -> (grid_tensor, caption)；先把所有要记录的图拼成 grid，
+        # 再统一分发给 wandb.Image 和本地 save_image，避免重复计算。
+        grids = {
+            'render_rgb':  (make_grid(pred_rgb_flat.cpu(), nrow=N, padding=2), 'rendered RGB'),
+            'render_mask': (make_grid(pred_mask_flat.cpu(), nrow=N, padding=2), 'rendered opacity/mask'),
+            'gt_images':   (make_grid(gt_flat.cpu(), nrow=N, padding=2), 'GT target views'),
         }
 
         # Source images
         if 'src_images' in batch:
             src = batch['src_images'][:n, 0].detach().float().clamp(0, 1).cpu()
-            imgs_log[f'{prefix}/src_images'] = wandb.Image(
-                make_grid(src, nrow=n, padding=2), caption='source images'
-            )
+            grids['src_images'] = (make_grid(src, nrow=n, padding=2), 'source images')
 
         # Head crops
         if 'source_head_rgbs' in batch:
             head = batch['source_head_rgbs'][:n, 0].detach().float().clamp(0, 1).cpu()
-            imgs_log[f'{prefix}/head_crops'] = wandb.Image(
-                make_grid(head, nrow=n, padding=2), caption='head crops'
-            )
+            grids['head_crops'] = (make_grid(head, nrow=n, padding=2), 'head crops')
 
         # Depth map (colormap via matplotlib if available)
         if 'comp_depth' in render_out:
@@ -484,18 +474,26 @@ class HumanLRMTrainer(Runner):
                 colored = torch.from_numpy(
                     np.stack([cmap(d.numpy())[:, :, :3] for d in depth_norm], axis=0)
                 ).permute(0, 3, 1, 2).float()
-                imgs_log[f'{prefix}/render_depth'] = wandb.Image(
-                    make_grid(colored, nrow=N, padding=2), caption='rendered depth'
-                )
+                grids['render_depth'] = (make_grid(colored, nrow=N, padding=2), 'rendered depth')
             except Exception:
                 pass
 
-        # GS scaling histogram
-        if 'scaling_output' in render_out and getattr(self, 'use_wandb', False):
-            scaling = render_out['scaling_output'][:n].detach().float().cpu().reshape(-1)
-            imgs_log[f'{prefix}/gs_scaling_hist'] = wandb.Histogram(scaling.numpy())
+        # 本地保存一份到 exp_dir/images/<prefix>/step_<step>/<name>.png
+        save_dir = os.path.join(self.exp_dir, 'images', prefix, f'step_{self.global_step:08d}')
+        os.makedirs(save_dir, exist_ok=True)
+        for name, (grid, _caption) in grids.items():
+            save_image(grid, os.path.join(save_dir, f'{name}.png'))
 
-        wandb.log(imgs_log, step=self.global_step)
+        if getattr(self, 'use_wandb', False):
+            imgs_log = {
+                f'{prefix}/{name}': wandb.Image(grid, caption=caption)
+                for name, (grid, caption) in grids.items()
+            }
+            # GS scaling histogram（只有 wandb 支持直方图，不存本地）
+            if 'scaling_output' in render_out:
+                scaling = render_out['scaling_output'][:n].detach().float().cpu().reshape(-1)
+                imgs_log[f'{prefix}/gs_scaling_hist'] = wandb.Histogram(scaling.numpy())
+            wandb.log(imgs_log, step=self.global_step)
 
     # ── 损失函数 ────────────────────────────────────────────────────────────
 
