@@ -665,22 +665,34 @@ class HumanLRMTrainer(Runner):
     def _compute_eval_metrics(self, render_out: dict, batch: dict) -> dict:
         """
         计算 PSNR / SSIM / LPIPS 评估指标（不加权、不参与反向传播，只用于监控）。
-        在 mask 区域内比较，与 masked_pixel loss 保持一致的比较口径——否则渲染器
-        合成的背景色和真实照片背景对不上，会让指标失真。
+
+        只在 mask 覆盖的前景区域内计算 PSNR/SSIM——如果先把背景乘成 0 再在整张图
+        （包含背景）上取平均，背景区域在 pred/gt 两边都是纯黑，会"假装"完美匹配，
+        背景占比越大，PSNR/SSIM 就被虚高拉升越多，并不能反映真实的渲染质量。
+        LPIPS 是特征距离不是逐像素 MSE，背景置零再算是这类指标常见的标准做法，
+        这里保留原来的处理方式。
         """
         pred_rgb  = render_out['comp_rgb'].contiguous().float().clamp(0, 1)
         gt_images = batch['render_images'].float().clamp(0, 1)
         gt_masks  = batch['render_masks'].float()
 
-        pred_masked = pred_rgb * gt_masks
-        gt_masked   = gt_images * gt_masks
+        B, N, C, H, W = pred_rgb.shape
+        pred_flat = pred_rgb.reshape(B * N, C, H, W)
+        gt_flat   = gt_images.reshape(B * N, C, H, W)
+        mask_c    = gt_masks.reshape(B * N, 1, H, W).expand(-1, C, -1, -1)
+        n_mask_px = mask_c.sum().clamp(min=1.0)
 
-        B, N, C, H, W = pred_masked.shape
-        pred_flat = pred_masked.reshape(B * N, C, H, W)
-        gt_flat   = gt_masked.reshape(B * N, C, H, W)
+        # masked PSNR：只在 mask 覆盖的像素上算 MSE
+        mse = ((pred_flat - gt_flat) ** 2 * mask_c).sum() / n_mask_px
+        psnr_val = -10.0 * torch.log10(mse.clamp(min=1e-10))
 
-        psnr_val = kornia_metrics.psnr(pred_flat, gt_flat, max_val=1.0).mean()
-        ssim_val = kornia_metrics.ssim(pred_flat, gt_flat, window_size=11, max_val=1.0).mean()
+        # masked SSIM：kornia 返回逐像素 SSIM map（不会自动 reduce），只在 mask
+        # 区域内取加权平均，而不是对整张图（含背景）做 .mean()。
+        ssim_map = kornia_metrics.ssim(pred_flat, gt_flat, window_size=11, max_val=1.0)
+        ssim_val = (ssim_map * mask_c).sum() / n_mask_px
+
+        pred_masked = (pred_flat * mask_c).reshape(B, N, C, H, W)
+        gt_masked   = (gt_flat * mask_c).reshape(B, N, C, H, W)
         lpips_val = self.perceptual_loss(pred_masked, gt_masked, is_training=False)
 
         return {
