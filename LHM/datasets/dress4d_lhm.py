@@ -424,12 +424,27 @@ class Dress4DLHMDataset(BaseDataset):
         self.all_views = [f'{index:02d}' for index in range(meta['view_count'])]
         selected = kwargs.get('eval_sample_ids')
         if selected is not None:
-            available = {entry.split('#', 1)[0] for entry in self.uids}
+            selected = [self._canonical_selected_uid(uid) for uid in selected]
+            # Eval normally uses val_list.json.  An explicit CLI selection is
+            # intentionally allowed to address a prepared train-list sample as
+            # well (useful for inspecting one item without changing the split).
+            entries = list(self.uids)
+            available = {entry.split('#', 1)[0] for entry in entries}
+            missing = [uid for uid in selected if uid not in available]
+            if missing:
+                for root in self.root_dirs:
+                    path = os.path.join(root, 'label', 'train_list.json')
+                    if os.path.isfile(path):
+                        with open(path) as handle:
+                            entries.extend(json.load(handle))
+                available = {entry.split('#', 1)[0] for entry in entries}
             missing = [uid for uid in selected if uid not in available]
             if missing:
                 raise ValueError(f'selected sample ids are not in prepared metadata: {missing[:10]}')
             selected_set = set(selected)
-            self.uids = [entry for entry in self.uids if entry.split('#', 1)[0] in selected_set]
+            self.uids = list(dict.fromkeys(
+                entry for entry in entries if entry.split('#', 1)[0] in selected_set
+            ))
         if eval_all_views:
             self.uids = list(dict.fromkeys(uid.split('#', 1)[0] for uid in self.uids))
 
@@ -437,6 +452,20 @@ class Dress4DLHMDataset(BaseDataset):
     def _parse_entry(entry):
         uid, sep, group = entry.partition('#')
         return uid, int(group[1:]) if sep else 0
+
+    @staticmethod
+    def _canonical_selected_uid(uid):
+        """Accept the same bare 4D-Dress ID form as Track prepare."""
+        uid = str(uid).strip().replace('\\', '/')
+        if '/' in uid:
+            return uid
+        fields = uid.split('_')
+        if len(fields) < 4:
+            raise ValueError(
+                'bare 4D-Dress sample id must be '
+                '<subject>_<outfit>_<take>_<frame>: ' + uid
+            )
+        return f'{"_".join(fields[:2])}/{uid}'
 
     def _face_bbox(self, uid):
         for root in self.root_dirs:

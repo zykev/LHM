@@ -42,12 +42,23 @@ class StaticHumanLHMDataset(BaseDataset):
         self.all_views = [f'{index:02d}' for index in range(self.meta['view_count'])]
         selected = kwargs.get('eval_sample_ids')
         if selected is not None:
-            available = {entry.split('#', 1)[0] for entry in self.uids}
+            entries = list(self.uids)
+            available = {entry.split('#', 1)[0] for entry in entries}
+            missing = [uid for uid in selected if uid not in available]
+            if missing:
+                for root in self.root_dirs:
+                    path = Path(root) / 'label' / 'train_list.json'
+                    if path.is_file():
+                        with path.open() as handle:
+                            entries.extend(json.load(handle))
+                available = {entry.split('#', 1)[0] for entry in entries}
             missing = [uid for uid in selected if uid not in available]
             if missing:
                 raise ValueError(f'selected sample ids are not in prepared metadata: {missing[:10]}')
             selected_set = set(selected)
-            self.uids = [entry for entry in self.uids if entry.split('#', 1)[0] in selected_set]
+            self.uids = list(dict.fromkeys(
+                entry for entry in entries if entry.split('#', 1)[0] in selected_set
+            ))
         if eval_all_views:
             self.uids = list(dict.fromkeys(entry.split('#', 1)[0] for entry in self.uids))
 
