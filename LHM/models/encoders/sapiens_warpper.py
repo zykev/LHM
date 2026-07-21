@@ -224,7 +224,11 @@ class SapiensWrapper(nn.Module):
         # in eager autocast under newer PyTorch versions.  Keep this frozen
         # feature extractor in FP32; the surrounding LHM training may still
         # use bf16 mixed precision.
-        with torch.no_grad():
+        # ``accelerate`` may have enabled an outer bf16 autocast context for
+        # the training step.  Disable it explicitly here: ``image.float()``
+        # alone is insufficient because Conv2d would otherwise be autocast
+        # again while executing this TorchScript graph.
+        with torch.no_grad(), torch.autocast(device_type="cuda", enabled=False):
             (out_local,) = self.model(image.float())
 
         out_global = None

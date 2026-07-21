@@ -181,6 +181,8 @@ class HumanLRMTrainer(Runner):
                             help='local .pth checkpoint, or "pretrained" (LHM-MINI)')
         parser.add_argument('--save-render', action='store_true')
         parser.add_argument('--output-dir', default=None)
+        parser.add_argument('--mixed-precision', choices=('no', 'fp16', 'bf16'), default=None,
+                            help='override Accelerator precision; use "no" for FP32 evaluation')
         parser.add_argument('--dataset-root', default=None,
                             help='raw dataset root used by an evaluation adapter')
         parser.add_argument('--metadata-root', default=None,
@@ -200,6 +202,8 @@ class HumanLRMTrainer(Runner):
             if not selected_ids:
                 parser.error('--sample-list is empty')
         cfg = OmegaConf.load(args.config)
+        if args.mixed_precision is not None:
+            cfg.train.mixed_precision = args.mixed_precision
         if args.dataset_root:
             cfg.dataset.raw_data_dir = args.dataset_root
         if args.metadata_root:
