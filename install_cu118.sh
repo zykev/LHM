@@ -1,5 +1,5 @@
 # install torch 2.3.0
-# pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cu118
+pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cu118
 pip install -U xformers==0.0.26.post1 --index-url https://download.pytorch.org/whl/cu118
 
 # install dependencies
