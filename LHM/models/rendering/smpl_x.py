@@ -670,10 +670,21 @@ class SMPLXModel(nn.Module):
         neutral_body_pose = (
             smpl_x.neutral_body_pose.view(1, -1).repeat(batch_size, 1).to(device)
         )  # 大 pose
-        zero_hand_pose = (
-            torch.zeros((batch_size, len(smpl_x.joint_part["lhand"]) * 3))
-            .float()
-            .to(device)
+        # SMPL-X expects PCA coefficients when its hand-PCA mode is enabled,
+        # whereas the rigid-transform construction below always needs the
+        # 15-joint axis-angle representation.
+        hand_pose_dim = (
+            self.smplx_layer.num_pca_comps
+            if self.smplx_layer.use_pca
+            else len(smpl_x.joint_part["lhand"]) * 3
+        )
+        zero_hand_pose_model = torch.zeros(
+            (batch_size, hand_pose_dim), dtype=torch.float32, device=device
+        )
+        zero_hand_pose_axis_angle = torch.zeros(
+            (batch_size, len(smpl_x.joint_part["lhand"]), 3),
+            dtype=torch.float32,
+            device=device,
         )
         zero_expr = torch.zeros((batch_size, smpl_x.expr_param_dim)).float().to(device)
 
@@ -708,8 +719,8 @@ class SMPLXModel(nn.Module):
         output = self.smplx_layer(
             global_orient=zero_pose,
             body_pose=neutral_body_pose,
-            left_hand_pose=zero_hand_pose,
-            right_hand_pose=zero_hand_pose,
+            left_hand_pose=zero_hand_pose_model,
+            right_hand_pose=zero_hand_pose_model,
             jaw_pose=jaw_pose,
             leye_pose=zero_pose,
             reye_pose=zero_pose,
@@ -732,10 +743,6 @@ class SMPLXModel(nn.Module):
         neutral_body_pose = neutral_body_pose.view(
             batch_size, len(smpl_x.joint_part["body"]) - 1, 3
         )
-        zero_hand_pose = zero_hand_pose.view(
-            batch_size, len(smpl_x.joint_part["lhand"]), 3
-        )
-
         neutral_body_pose_inv = matrix_to_axis_angle(
             torch.inverse(axis_angle_to_matrix(neutral_body_pose))
         )
@@ -753,8 +760,8 @@ class SMPLXModel(nn.Module):
                 jaw_pose_inv,
                 zero_pose,
                 zero_pose,
-                zero_hand_pose,
-                zero_hand_pose,
+                zero_hand_pose_axis_angle,
+                zero_hand_pose_axis_angle,
             ),
             dim=1,
         )
@@ -784,10 +791,13 @@ class SMPLXModel(nn.Module):
             .float()
             .to(device)
         )
-        zero_hand_pose = (
-            torch.zeros((batch_size, len(smpl_x.joint_part["lhand"]) * 3))
-            .float()
-            .to(device)
+        hand_pose_dim = (
+            self.smplx_layer.num_pca_comps
+            if self.smplx_layer.use_pca
+            else len(smpl_x.joint_part["lhand"]) * 3
+        )
+        zero_hand_pose = torch.zeros(
+            (batch_size, hand_pose_dim), dtype=torch.float32, device=device
         )
         zero_expr = torch.zeros((batch_size, smpl_x.expr_param_dim)).float().to(device)
 
@@ -820,6 +830,30 @@ class SMPLXModel(nn.Module):
             )  # zero pose human
             return mesh_zero_pose_upsampled, mesh_zero_pose, joint_zero_pose
 
+    def hand_pose_to_axis_angle(self, hand_pose, hand_side):
+        """Expand SMPL-X hand PCA coefficients to the 15-joint pose for LBS."""
+        if hand_pose.shape[-2:] == (15, 3):
+            return hand_pose
+        if hand_pose.shape[-1] == 45:
+            return hand_pose.reshape(*hand_pose.shape[:-1], 15, 3)
+        if not self.smplx_layer.use_pca:
+            raise ValueError(
+                f"Expected a 45-D {hand_side} hand pose, got {tuple(hand_pose.shape)}"
+            )
+
+        components = getattr(self.smplx_layer, f"{hand_side}_hand_components")
+        if hand_pose.shape[-1] != components.shape[0]:
+            raise ValueError(
+                f"Expected {components.shape[0]} PCA coefficients for {hand_side} hand, "
+                f"got {tuple(hand_pose.shape)}"
+            )
+        pose_shape = hand_pose.shape[:-1]
+        pose = torch.einsum("bi,ij->bj", hand_pose.reshape(-1, hand_pose.shape[-1]), components)
+        # SMPL-X adds the hand part of pose_mean after PCA expansion in forward().
+        mean_start = 75 if hand_side == "left" else 120
+        pose = pose + self.smplx_layer.pose_mean[mean_start:mean_start + 45]
+        return pose.reshape(*pose_shape, 15, 3)
+
     def get_transform_mat_joint(
         self, transform_mat_neutral_pose, joint_zero_pose, smplx_param
     ):
@@ -841,8 +875,8 @@ class SMPLXModel(nn.Module):
         jaw_pose = smplx_param["jaw_pose"]
         leye_pose = smplx_param["leye_pose"]
         reye_pose = smplx_param["reye_pose"]
-        lhand_pose = smplx_param["lhand_pose"]
-        rhand_pose = smplx_param["rhand_pose"]
+        lhand_pose = self.hand_pose_to_axis_angle(smplx_param["lhand_pose"], "left")
+        rhand_pose = self.hand_pose_to_axis_angle(smplx_param["rhand_pose"], "right")
         # trans = smplx_param['trans']
 
         # forward kinematics
@@ -892,8 +926,8 @@ class SMPLXModel(nn.Module):
         jaw_pose = smplx_param["jaw_pose"]
         leye_pose = smplx_param["leye_pose"]
         reye_pose = smplx_param["reye_pose"]
-        lhand_pose = smplx_param["lhand_pose"]
-        rhand_pose = smplx_param["rhand_pose"]
+        lhand_pose = self.hand_pose_to_axis_angle(smplx_param["lhand_pose"], "left")
+        rhand_pose = self.hand_pose_to_axis_angle(smplx_param["rhand_pose"], "right")
         batch_size = root_pose.shape[0]
 
         pose = torch.cat(
