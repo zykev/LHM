@@ -206,7 +206,6 @@ class SapiensWrapper(nn.Module):
         for name, param in self.model.named_parameters():
             param.requires_grad = False
 
-    @torch.compile
     def forward(self, image: torch.Tensor, mod: torch.Tensor = None):
         # image: [N, C, H, W]
         # mod: [N, D] or None
@@ -220,8 +219,13 @@ class SapiensWrapper(nn.Module):
             image.shape[-1] // 16,
         )
 
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            (out_local,) = self.model(image)
+        # The released Sapiens .pt2 checkpoint is a TorchScript FP32 graph.
+        # In particular, its serialized Conv2d does not reliably participate
+        # in eager autocast under newer PyTorch versions.  Keep this frozen
+        # feature extractor in FP32; the surrounding LHM training may still
+        # use bf16 mixed precision.
+        with torch.no_grad():
+            (out_local,) = self.model(image.float())
 
         out_global = None
         if out_global is not None:
