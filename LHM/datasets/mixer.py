@@ -58,6 +58,10 @@ class MixerDataset(torch.utils.data.Dataset):
             from .dress4d_lhm import Dress4DLHMDataset
             dataset_cls = Dress4DLHMDataset
 
+        elif name == "static_human_lhm":
+            from .static_human_lhm import StaticHumanLHMDataset
+            dataset_cls = StaticHumanLHMDataset
+
         else:
             raise NotImplementedError(f"Dataset {name} not implemented")
 

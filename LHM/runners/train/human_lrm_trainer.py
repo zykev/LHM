@@ -14,6 +14,7 @@ HumanLRMTrainer — LHM-mini 在 4DDress 数据集上的训练 Runner。
 """
 
 import glob
+import json
 import logging
 import math
 import os
@@ -171,12 +172,49 @@ class HumanLRMTrainer(Runner):
 
     @staticmethod
     def _load_config() -> DictConfig:
-        """从命令行 --config 参数加载 YAML 配置。"""
+        """Load config plus evaluation-only dataset/checkpoint overrides."""
         import argparse
         parser = argparse.ArgumentParser()
         parser.add_argument('--config', type=str, required=True)
+        parser.add_argument('--eval-only', action='store_true')
+        parser.add_argument('--checkpoint', default=None,
+                            help='local .pth checkpoint, or "pretrained" (LHM-MINI)')
+        parser.add_argument('--save-render', action='store_true')
+        parser.add_argument('--output-dir', default=None)
+        parser.add_argument('--dataset-root', default=None,
+                            help='raw dataset root used by an evaluation adapter')
+        parser.add_argument('--metadata-root', default=None,
+                            help='LHM-Track prepare output root used by an evaluation adapter')
+        parser.add_argument('--sample-id', action='append',
+                            help='evaluate one prepared sample id (can be repeated)')
+        parser.add_argument('--sample-list', default=None,
+                            help='newline-delimited prepared sample IDs to evaluate')
         args, _ = parser.parse_known_args()
+        if args.sample_id and args.sample_list:
+            parser.error('use --sample-id or --sample-list, not both')
+        selected_ids = args.sample_id
+        if args.sample_list:
+            with open(args.sample_list) as handle:
+                selected_ids = [line.split('#', 1)[0].strip() for line in handle]
+            selected_ids = [item for item in selected_ids if item]
+            if not selected_ids:
+                parser.error('--sample-list is empty')
         cfg = OmegaConf.load(args.config)
+        if args.dataset_root:
+            cfg.dataset.raw_data_dir = args.dataset_root
+        if args.metadata_root:
+            for subset in cfg.dataset.subsets:
+                subset.root_dirs = [args.metadata_root]
+                subset.meta_path.train = os.path.join(args.metadata_root, 'label', 'train_list.json')
+                subset.meta_path.val = os.path.join(args.metadata_root, 'label', 'val_list.json')
+        if selected_ids is not None:
+            cfg.dataset.eval_sample_ids = selected_ids
+        cfg.runtime = {
+            'eval_only': args.eval_only,
+            'checkpoint': args.checkpoint,
+            'save_render': args.save_render,
+            'output_dir': args.output_dir,
+        }
         return cfg
 
     # ── Accelerator / Logger ────────────────────────────────────────────────
@@ -281,16 +319,28 @@ class HumanLRMTrainer(Runner):
         mc_dict = OmegaConf.to_container(mc, resolve=True)
         mc_dict.pop('model_name', None)
 
-        self.model = model_cls(**mc_dict)
-
-        # 可选：从 checkpoint 加载预训练权重
-        ckpt_path = self.cfg.saver.get('load_model', None)
-        if ckpt_path and os.path.exists(ckpt_path):
-            state = torch.load(ckpt_path, map_location='cpu')
-            key_prefix = 'module.'
-            state = {k.removeprefix(key_prefix): v for k, v in state.items()}
-            missing, unexpected = self.model.load_state_dict(state, strict=False)
-            logger.info(f'加载权重 {ckpt_path}，missing={len(missing)}, unexpected={len(unexpected)}')
+        runtime_ckpt = self.cfg.runtime.get('checkpoint', None)
+        ckpt_path = runtime_ckpt or self.cfg.saver.get('load_model', None)
+        if ckpt_path == 'pretrained':
+            from LHM.utils.hf_hub import wrap_model_hub
+            hf_model_cls = wrap_model_hub(model_cls)
+            pretrained = hf_model_cls.from_pretrained('3DAIGC/LHM-MINI')
+            # Keep the local 4D-Dress SMPL-X/PCA renderer configuration while
+            # reusing the learned network weights from the official model.
+            self.model = model_cls(**mc_dict)
+            missing, unexpected = self.model.load_state_dict(pretrained.state_dict(), strict=False)
+            logger.info('加载预训练模型: 3DAIGC/LHM-MINI')
+            logger.info(f'预训练权重 missing={len(missing)}, unexpected={len(unexpected)}')
+        else:
+            self.model = model_cls(**mc_dict)
+            if ckpt_path:
+                if not os.path.isfile(ckpt_path):
+                    raise FileNotFoundError(f'checkpoint does not exist: {ckpt_path}')
+                state = torch.load(ckpt_path, map_location='cpu')
+                state = state.get('model', state)
+                state = {k.removeprefix('module.'): v for k, v in state.items()}
+                missing, unexpected = self.model.load_state_dict(state, strict=False)
+                logger.info(f'加载权重 {ckpt_path}，missing={len(missing)}, unexpected={len(unexpected)}')
 
         # 统计参数量
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -311,8 +361,7 @@ class HumanLRMTrainer(Runner):
         dataset_kwargs.pop('num_val_workers', None)
         dataset_kwargs.pop('pin_mem', None)
         dataset_kwargs.pop('repeat_num', None)
-        # multiply 不再 pop 掉——Dress4DLHMDataset 现在要用它把最终图像尺寸
-        # 对齐到 multiply 的整数倍（跟 ViT patch size 对齐，见 _calc_tgt_hw）。
+        # 4D-Dress 使用该值将 crop/resize 后尺寸与 ViT patch 对齐。
 
         subsets = OmegaConf.to_container(dc.subsets, resolve=True)
 
@@ -320,7 +369,9 @@ class HumanLRMTrainer(Runner):
             split='train', subsets=subsets, **dataset_kwargs
         )
         self.val_dataset = MixerDataset(
-            split='val', subsets=subsets, **dataset_kwargs
+            split='val', subsets=subsets,
+            eval_all_views=self.cfg.runtime.get('eval_only', False),
+            **dataset_kwargs,
         )
 
         num_train_workers = dc.get('num_train_workers', 4)
@@ -777,7 +828,7 @@ class HumanLRMTrainer(Runner):
         self.model.eval()
         device  = self.accelerator.device
         val_cfg = self.cfg.val
-        n_debug = val_cfg.get('debug_batches', 10)
+        n_debug = 0 if self.cfg.runtime.get('eval_only', False) else val_cfg.get('debug_batches', 10)
         img_mon = self.cfg.logger.get('image_monitor', {})
         n_log   = img_mon.get('samples_per_log', 2)
 
@@ -822,6 +873,9 @@ class HumanLRMTrainer(Runner):
             for k, v in self._compute_eval_metrics(render_out, batch_dev).items():
                 agg_metrics[k] += v
             count += 1
+
+            if self.cfg.runtime.get('save_render', False) and self.accelerator.is_main_process:
+                self._save_eval_renders(render_out, batch)
 
             # Keep the first batch for image logging
             if first_render_out is None:
@@ -869,9 +923,36 @@ class HumanLRMTrainer(Runner):
                     ', '.join(f'{k}={v:.4f}' for k, v in avg.items()))
         return avg
 
+    @torch.no_grad()
+    def _save_eval_renders(self, render_out: dict, batch: dict):
+        """Save prediction-only renders; GT/source/masks are intentionally omitted."""
+        root = self.cfg.runtime.get('output_dir') or os.path.join(self.exp_dir, 'eval')
+        renders = render_out['comp_rgb'].detach().float().cpu()
+        uids = batch.get('uid', [f'sample_{i:05d}' for i in range(renders.shape[0])])
+        if isinstance(uids, str):
+            uids = [uids]
+        for batch_idx, uid in enumerate(uids):
+            sample_dir = os.path.join(root, 'renders', str(uid))
+            os.makedirs(sample_dir, exist_ok=True)
+            view_ids = batch.get('render_view_ids', [f'{index:02d}' for index in range(renders.shape[1])])
+            if isinstance(view_ids, list):
+                view_ids = [value[batch_idx] if isinstance(value, (list, tuple)) else value for value in view_ids]
+            for view_idx, image in enumerate(renders[batch_idx]):
+                save_image(image.clamp(0, 1), os.path.join(sample_dir, f'{view_ids[view_idx]}.png'))
+
     # ── 主训练循环 ────────────────────────────────────────────────────────────
 
     def run(self):
+        if self.cfg.runtime.get('eval_only', False):
+            metrics = self._validate()
+            if self.accelerator.is_main_process:
+                root = self.cfg.runtime.get('output_dir') or os.path.join(self.exp_dir, 'eval')
+                os.makedirs(root, exist_ok=True)
+                with open(os.path.join(root, 'metrics.json'), 'w', encoding='utf-8') as handle:
+                    json.dump(metrics, handle, indent=2)
+                logger.info(f'evaluation metrics: {os.path.join(root, "metrics.json")}')
+            return
+
         tc        = self.cfg.train
         val_cfg   = self.cfg.val
         saver_cfg = self.cfg.saver

@@ -2,7 +2,7 @@
 # LHM-mini 在 4DDress 多视角数据集上的训练配置
 # ============================================================
 # 前置步骤：
-#   1. 运行 prepare_4ddress.py 生成 smplx_params/, cameras.json, (flame_params/)
+#   1. 运行 prepare_4ddress.py 生成训练清单和 face_bbox/
 #   2. 确认 pretrained_models/ 下所有资产已下载（见 README）
 # 启动：
 #   accelerate launch --config_file configs/accelerate.yaml \
@@ -42,6 +42,8 @@ model:
   human_model_path: ./pretrained_models/human_model_files
   smplx_subdivide_num: 1
   smplx_type: smplx_2
+  smplx_use_pca: true
+  smplx_num_pca_comps: 12
   gs_query_dim: 1024
   gs_use_rgb: true
   gs_sh: 3
@@ -78,11 +80,11 @@ dataset:
       use_flame: false        # 若 prepare_4ddress.py 已跑 flame，可改为 true
       src_head_size: 112
 
-  # 4DDress 共 4 路相机：前视角为 source，全部 4 路同时作为 target（含前视角自重建）
+  # 每条 label entry 已指定一个 24-view 的 target group。
   sample_side_views: 4
 
   # 原始 4DDress 数据路径（Dataset 直接从此处读取各视角图像）
-  raw_data_dir: ".datasets/4ddress1"
+  raw_data_dir: ".datasets/4d-dress"
 
   source_image_res: 512
   render_image:

@@ -59,6 +59,8 @@ class SMPLX(object):
         expr_param_dim=50,
         subdivide_num=2,
         cano_pose_type=0,
+        use_pca=False,
+        num_pca_comps=12,
     ):
         """SMPLX using pytorch3d subdivsion"""
         super().__init__()
@@ -85,9 +87,9 @@ class SMPLX(object):
                     gender=gender,
                     num_betas=self.shape_param_dim,
                     num_expression_coeffs=self.expr_param_dim,
-                    use_pca=False,
+                    use_pca=use_pca, num_pca_comps=num_pca_comps,
                     use_face_contour=False,
-                    flat_hand_mean=True,
+                    flat_hand_mean=not use_pca,
                     **self.layer_arg,
                 )
                 for gender in ["neutral", "male", "female"]
@@ -112,9 +114,9 @@ class SMPLX(object):
                     gender=gender,
                     num_betas=self.shape_param_dim,
                     num_expression_coeffs=self.expr_param_dim,
-                    use_pca=False,
+                    use_pca=use_pca, num_pca_comps=num_pca_comps,
                     use_face_contour=True,
-                    flat_hand_mean=True,
+                    flat_hand_mean=not use_pca,
                     **self.layer_arg,
                 )
                 for gender in ["neutral", "male", "female"]
@@ -520,6 +522,8 @@ class SMPLXModel(nn.Module):
         shape_param_dim=100,
         cano_pose_type=0,
         apply_pose_blendshape=False,
+        use_pca=False,
+        num_pca_comps=12,
     ) -> None:
         super().__init__()
 
@@ -537,6 +541,7 @@ class SMPLXModel(nn.Module):
             expr_param_dim=expr_param_dim,
             subdivide_num=subdivide_num,
             cano_pose_type=cano_pose_type,
+            use_pca=use_pca, num_pca_comps=num_pca_comps,
         )
         self.smplx_layer = copy.deepcopy(self.smpl_x.layer[gender])
 

@@ -1,0 +1,106 @@
+# Evaluation-only configuration for Track-prepared THuman / HuGe100K metadata.
+# The scripts pass --dataset-root and --metadata-root; no training script uses
+# this file.  Both datasets use full 45-D hand pose, and their 10 expression
+# values are zero-padded by the adapter to LHM-MINI's 100-D renderer input.
+experiment:
+  type: lrm
+  seed: 42
+  parent: LHM-static-eval
+  child: LHM-MINI
+
+model:
+  model_name: SapDinoLRMBHSD3_5
+  encoder_type: dinov2_fusion
+  encoder_model_name: dinov2_vitl14_reg
+  encoder_feat_dim: 1024
+  encoder_freeze: false
+  fine_encoder_type: sapiens
+  fine_encoder_model_name: ./pretrained_models/sapiens/pretrained/checkpoints/sapiens_1b/sapiens_1b_epoch_173_torchscript.pt2
+  fine_encoder_feat_dim: 1536
+  fine_encoder_freeze: true
+  use_face_id: true
+  latent_query_points_type: e2e_smplx_sub1
+  pcl_dim: 1024
+  facesr: false
+  transformer_type: sd3_mm_bh_cond
+  transformer_heads: 16
+  transformer_dim: 1024
+  transformer_layers: 2
+  tf_grad_ckpt: true
+  encoder_grad_ckpt: true
+  human_model_path: ./pretrained_models/human_model_files
+  smplx_subdivide_num: 1
+  smplx_type: smplx_2
+  smplx_use_pca: false
+  smplx_num_pca_comps: 12
+  gs_query_dim: 1024
+  gs_use_rgb: true
+  gs_sh: 3
+  dense_sample_pts: 20000
+  gs_mlp_network_config:
+    n_neurons: 512
+    n_hidden_layers: 2
+    activation: silu
+  gs_xyz_offset_max_step: 1.0
+  gs_clip_scaling: [100, 0.01, 0.05, 3000]
+  expr_param_dim: 100
+  shape_param_dim: 10
+  fix_opacity: false
+  fix_rotation: false
+  cano_pose_type: 1
+
+dataset:
+  subsets:
+    - name: static_human_lhm
+      root_dirs: [../LHM_Track/train_data/thuman_lhm]
+      meta_path:
+        train: ../LHM_Track/train_data/thuman_lhm/label/train_list.json
+        val: ../LHM_Track/train_data/thuman_lhm/label/val_list.json
+      sample_rate: 1.0
+      use_flame: false
+      src_head_size: 112
+  raw_data_dir: .datasets/THuman
+  source_image_res: 512
+  render_image:
+    low: 384
+    high: 384
+    region: null
+  num_train_workers: 0
+  num_val_workers: 2
+  multiply: 16
+  pin_mem: true
+  repeat_num: 1
+
+# These fields are retained because the shared runner initializes them even in
+# --eval-only mode.  No optimizer step is performed by the evaluation scripts.
+train:
+  mixed_precision: bf16
+  find_unused_parameters: false
+  batch_size: 1
+  accum_steps: 1
+  epochs: 1
+  loss_func:
+    pixel_loss: l1
+    ball_loss: {type: heuristic, group: {head: 1.0, lower_body: 100.0, upper_body: 1000.0, hands: 10000.0}}
+    offset_loss: {type: classical, group: {head: 1.0, lower_body: 1.0, upper_body: 1000.0, hands: 1000.0}}
+  loss:
+    pixel_weight: 0.0
+    masked_pixel_weight: 1.0
+    perceptual_weight: 1.0
+    mask_weight: '0:2.0:1.0:3000'
+    face_id_weight: '0:0.01:0.05:3000'
+    asap_weight: '0:1.0:10.0:3000'
+    acap_weight: '0:1.0:1000.0:3000'
+  optim: {lr: 0.0004, weight_decay: 0.05, beta1: 0.9, beta2: 0.95, clip_grad_norm: 0.1}
+  scheduler: {type: cosine, warmup_real_iters: 3000}
+
+val: {batch_size: 1, global_step_period: 1000, debug_batches: 10}
+saver: {auto_resume: false, load_model: null, checkpoint_root: ./exps/checkpoints, checkpoint_global_steps: 1000, checkpoint_keep_level: 1}
+logger:
+  stream_level: WARNING
+  log_level: INFO
+  log_root: ./exps/logs
+  tracker_root: ./exps/trackers
+  enable_profiler: false
+  trackers: []
+compile: {suppress_errors: true, print_specializations: true, disable: true}

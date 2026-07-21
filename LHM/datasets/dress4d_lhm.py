@@ -15,6 +15,7 @@ Dress4DLHMDataset — 4DDress 多视角数据集适配 LHM 训练格式。
 import glob
 import json
 import os
+import pickle
 import random
 
 import cv2
@@ -24,7 +25,7 @@ import torch
 from .base import BaseDataset
 
 CAMERA_VIEWS = ['0004', '0028', '0052', '0076']
-ASPECT_HW = 5.0 / 3.0  # LHM 期望的高:宽
+ASPECT_HW = 5.0 / 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -41,17 +42,16 @@ def _find_capture_file(cam_raw_dir: str, frame_idx: int, subdir: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 跟 LHM 官方 runners/infer/utils.py:preprocess_image 对齐的预处理流程
-# （resize_image_keepaspect_np / center_crop_according_to_mask /
-#  calc_new_tgt_size_by_aspect 的训练数据版本，逐帧用真实 mask 动态裁剪，
-#  而不是像旧版 _crop_params 那样只按相机的静态分辨率做几何中心裁剪）
+# Match LHM's original preprocessing: resize the long edge, crop around the
+# optical axis using the foreground mask, then resize to the network size.
+# The crop is centered on (cx, cy), which is essential because the legacy DGR
+# rasterizer uses a symmetric FoV projection and does not consume cx/cy.
 # ---------------------------------------------------------------------------
 
-MAX_TGT_SIZE = 896  # 与官方 human_lrm.py 里硬编码的 max_tgt_size 保持一致
+MAX_TGT_SIZE = 896
 
 
 def _resize_keepaspect(img: np.ndarray, max_tgt_size: int):
-    """按最长边等比缩放到 max_tgt_size，返回 (resized_img, ratio)。"""
     h, w = img.shape[:2]
     ratio = max_tgt_size / max(h, w)
     new_h, new_w = round(h * ratio), round(w * ratio)
@@ -60,139 +60,114 @@ def _resize_keepaspect(img: np.ndarray, max_tgt_size: int):
 
 
 def _center_crop_by_mask(img: np.ndarray, mask: np.ndarray, cx: float, cy: float,
-                          aspect_standard: float, enlarge_ratio=(1.0, 1.0)):
-    """以相机真实光轴位置 (cx, cy) 为基准（不是图像几何中心！），裁出"刚好包住
-    整个 mask、且满足目标纵横比"的区域，裁剪框只会被撑大以满足纵横比，不会缩小
-    到比 mask 包围盒还小——保证不裁到人。
-
-    GS3DRenderer 的投影矩阵（getProjectionMatrix/intrinsic_to_fov）是完全对称的
-    视锥，只用 fx,fy 算 FoV，根本不读 cx,cy，也就是说渲染器只能正确渲染"光轴正
-    好在画面中心"的相机。如果围绕图像几何中心裁剪，再在 _load_view 里把 cx,cy
-    强制设成新图像中心，等于无视了真实标定的 cx,cy 跟几何中心之间的差异，凭空
-    引入一个恒定的像素偏移（4DDress 真实相机的 cx,cy 并不在图像几何中心）。围绕
-    真实 cx,cy 裁剪，才能保证裁完之后真实光轴恰好落在新图像中心，让后面"强制
-    居中"是一个几乎无误差的精确陈述，而不是引入偏移。
-
-    返回 (cropped_img, cropped_mask, offset_x, offset_y)。
-    """
+                         aspect_standard: float, enlarge_ratio=(1.0, 1.0)):
+    """Crop a symmetric rectangle around the calibrated optical axis."""
     ys, xs = np.where(mask > 0)
-    H, W = img.shape[:2]
+    height, width = img.shape[:2]
     if len(xs) == 0 or len(ys) == 0:
-        # 没有有效前景区域，没法用 mask 定位，退化成保留原图（不裁剪）
         return img, mask, 0, 0
 
     x_min, x_max, y_min, y_max = xs.min(), xs.max(), ys.min(), ys.max()
     cx_i, cy_i = int(round(cx)), int(round(cy))
-
     half_w = max(abs(cx_i - x_min), abs(cx_i - x_max))
     half_h = max(abs(cy_i - y_min), abs(cy_i - y_max))
     half_w_raw, half_h_raw = half_w, half_h
-    aspect = half_h / max(half_w, 1)
-
-    if aspect >= aspect_standard:
+    if half_h / max(half_w, 1) >= aspect_standard:
         half_w = round(half_h / aspect_standard)
     else:
         half_h = round(half_w * aspect_standard)
 
-    # 不超出原图边界：注意 cx,cy 不在几何中心，左右/上下可用空间不对称
-    max_half_w = min(cx_i, W - cx_i)
-    max_half_h = min(cy_i, H - cy_i)
+    max_half_w = min(cx_i, width - cx_i)
+    max_half_h = min(cy_i, height - cy_i)
     if half_h > max_half_h:
-        half_w = round(half_h_raw / aspect_standard)
-        half_h = half_h_raw
+        half_w, half_h = round(half_h_raw / aspect_standard), half_h_raw
     if half_w > max_half_w:
-        half_h = round(half_w_raw * aspect_standard)
-        half_w = half_w_raw
+        half_h, half_w = round(half_w_raw * aspect_standard), half_w_raw
 
     if abs(enlarge_ratio[0] - 1) > 0.01 or abs(enlarge_ratio[1] - 1) > 0.01:
-        enlarge_min, enlarge_max = enlarge_ratio
-        enlarge_max_real = min(max_half_h / max(half_h, 1), max_half_w / max(half_w, 1))
-        enlarge_max = min(enlarge_max_real, enlarge_max)
-        enlarge_min = min(enlarge_max_real, enlarge_min)
-        cur = np.random.rand() * (enlarge_max - enlarge_min) + enlarge_min
-        half_h, half_w = round(cur * half_h), round(cur * half_w)
+        min_ratio, max_ratio = enlarge_ratio
+        max_ratio = min(max_ratio, max_half_h / max(half_h, 1), max_half_w / max(half_w, 1))
+        min_ratio = min(min_ratio, max_ratio)
+        ratio = np.random.rand() * (max_ratio - min_ratio) + min_ratio
+        half_h, half_w = round(ratio * half_h), round(ratio * half_w)
 
-    half_h = min(half_h, max_half_h)
-    half_w = min(half_w, max_half_w)
+    half_h, half_w = min(half_h, max_half_h), min(half_w, max_half_w)
+    offset_x, offset_y = cx_i - half_w, cy_i - half_h
+    return (
+        img[offset_y:offset_y + 2 * half_h, offset_x:offset_x + 2 * half_w],
+        mask[offset_y:offset_y + 2 * half_h, offset_x:offset_x + 2 * half_w],
+        offset_x,
+        offset_y,
+    )
 
-    offset_x = cx_i - half_w
-    offset_y = cy_i - half_h
-    cropped_img  = img[offset_y:offset_y + 2 * half_h, offset_x:offset_x + 2 * half_w]
-    cropped_mask = mask[offset_y:offset_y + 2 * half_h, offset_x:offset_x + 2 * half_w]
-    return cropped_img, cropped_mask, offset_x, offset_y
 
-
-def _calc_tgt_hw(aspect_standard: float, tgt_w: int, multiply: int):
-    """目标 (H, W)：H = tgt_w * aspect_standard，两边都向下取整到 multiply 的
-    整数倍（跟 ViT patch size 对齐，避免 patch embedding 卷积在边缘截断）。"""
-    tgt_h = tgt_w * aspect_standard
-    tgt_h = max(int(tgt_h / multiply) * multiply, multiply)
-    tgt_w = max(int(tgt_w / multiply) * multiply, multiply)
-    return tgt_h, tgt_w
+def _calc_tgt_hw(aspect_standard: float, target_w: int, multiply: int):
+    target_h = max(int((target_w * aspect_standard) / multiply) * multiply, multiply)
+    target_w = max(int(target_w / multiply) * multiply, multiply)
+    return target_h, target_w
 
 
 def _load_view(img_path: str, mask_path: str, K_raw: np.ndarray, target_w: int,
                multiply: int, aspect_standard: float = ASPECT_HW,
-               max_tgt_size: int = MAX_TGT_SIZE, enlarge_ratio=(1.0, 1.0)):
-    """完整复刻 LHM 官方 preprocess_image 的预处理流程：
-    1. 读图 + mask，背景合成纯白（跟渲染器 render_bg_colors 一致）
-    2. 按最长边等比缩放到 max_tgt_size，统一不同原始分辨率下人物的像素尺度
-    3. 用 mask 包围盒、围绕图像几何中心裁出恰好包住人、满足目标纵横比的区域
-       （旧版 _crop_params 只按相机的静态分辨率裁固定窗口，不看人在画面里的
-       实际位置/姿态，可能裁到人；这里跟官方一样动态保证不裁到人）
-    4. resize 到最终输出尺寸（取整到 multiply 的整数倍）
-    5. 相机内参跟每一步同步变换，最终强制主点居中（此时已非常接近图像中心，
-       跟官方在 utils.py 里的断言一致，强制居中不会引入明显误差）
-    返回 (img_tensor[3,H,W], mask_tensor[1,H,W], intr_4x4)。
-    """
-    tgt_h, tgt_w = _calc_tgt_hw(aspect_standard, target_w, multiply)
+               max_tgt_size: int = MAX_TGT_SIZE, enlarge_ratio=(1.0, 1.0),
+               infer_white_background: bool = False):
+    """Apply LHM preprocessing and propagate every image-space K transform."""
+    target_h, target_w = _calc_tgt_hw(aspect_standard, target_w, multiply)
 
     img_bgr = cv2.imread(img_path) if img_path else None
     if img_bgr is None:
-        img_t  = torch.ones(3, tgt_h, tgt_w, dtype=torch.float32)
-        mask_t = torch.zeros(1, tgt_h, tgt_w, dtype=torch.float32)
+        img_t = torch.ones(3, target_h, target_w, dtype=torch.float32)
+        mask_t = torch.zeros(1, target_h, target_w, dtype=torch.float32)
         intr = torch.eye(4, dtype=torch.float32)
-        intr[0, 2], intr[1, 2] = tgt_w / 2, tgt_h / 2
+        intr[0, 2], intr[1, 2] = target_w / 2, target_h / 2
         return img_t, mask_t, intr
 
     mask_gray = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE) if mask_path else None
     img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    mask = (mask_gray > 127).astype(np.float32) if mask_gray is not None \
-        else np.ones(img.shape[:2], dtype=np.float32)
+    if mask_gray is not None:
+        mask = (mask_gray > 127).astype(np.float32)
+    elif infer_white_background:
+        # HuGe100K has no separate alpha/mask; this is its documented
+        # foreground definition and must also drive the calibrated crop.
+        mask = (~np.all(img_bgr >= 245, axis=-1)).astype(np.float32)
+    else:
+        mask = np.ones(img.shape[:2], dtype=np.float32)
 
     # 背景合成纯白
     img = img * mask[:, :, None] + 1.0 * (1 - mask[:, :, None])
 
     K = K_raw.astype(np.float64).copy()
-
-    # 1) 按最长边缩放到 max_tgt_size
     img, ratio0 = _resize_keepaspect(img, max_tgt_size)
-    mask, _     = _resize_keepaspect(mask, max_tgt_size)
+    mask, _ = _resize_keepaspect(mask, max_tgt_size)
     K[0, 0] *= ratio0; K[0, 2] *= ratio0
     K[1, 1] *= ratio0; K[1, 2] *= ratio0
 
-    # 2) 用 mask 包围盒裁剪，保证不裁到人；围绕相机真实光轴 (K[0,2],K[1,2])，
-    # 不是图像几何中心（见 _center_crop_by_mask 注释）
-    img, mask, off_x, off_y = _center_crop_by_mask(
+    img, mask, offset_x, offset_y = _center_crop_by_mask(
         img, mask, K[0, 2], K[1, 2], aspect_standard, enlarge_ratio
     )
-    K[0, 2] -= off_x
-    K[1, 2] -= off_y
+    K[0, 2] -= offset_x
+    K[1, 2] -= offset_y
 
-    # 3) resize 到最终目标尺寸
-    cur_h, cur_w = img.shape[:2]
-    ratio_y, ratio_x = tgt_h / cur_h, tgt_w / cur_w
-    img  = cv2.resize(img,  (tgt_w, tgt_h), interpolation=cv2.INTER_AREA)
-    mask = cv2.resize(mask, (tgt_w, tgt_h), interpolation=cv2.INTER_NEAREST)
+    crop_h, crop_w = img.shape[:2]
+    ratio_y, ratio_x = target_h / crop_h, target_w / crop_w
+    img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
     K[0, 0] *= ratio_x; K[0, 2] *= ratio_x
     K[1, 1] *= ratio_y; K[1, 2] *= ratio_y
 
-    # 4) 强制主点居中
+    # DGR's FoV projection has no principal-point term.  Do not hide an
+    # off-centre calibration by overwriting K: reject it so the mismatch is
+    # visible instead of silently producing shifted Gaussian renders.
+    expected_center = np.array([target_w * 0.5, target_h * 0.5])
+    actual_center = K[:2, 2]
+    if not np.allclose(actual_center, expected_center, rtol=0.0, atol=1e-4):
+        raise ValueError(
+            'LHM crop did not center the optical axis: '
+            f'got {actual_center.tolist()}, expected {expected_center.tolist()}'
+        )
+
     intr = torch.eye(4, dtype=torch.float32)
-    intr[0, 0] = float(K[0, 0])
-    intr[1, 1] = float(K[1, 1])
-    intr[0, 2] = tgt_w / 2
-    intr[1, 2] = tgt_h / 2
+    intr[:3, :3] = torch.from_numpy(K.astype(np.float32))
 
     img_t  = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1)
     mask_t = torch.from_numpy((mask > 0.5).astype(np.float32)).unsqueeze(0)
@@ -203,12 +178,12 @@ def _load_view(img_path: str, mask_path: str, K_raw: np.ndarray, target_w: int,
 # Dataset
 # ---------------------------------------------------------------------------
 
-class Dress4DLHMDataset(BaseDataset):
+class LegacyDress4DLHMDataset(BaseDataset):
     """
     4DDress 数据集适配 LHM 训练。每个样本为一帧多视角数据：
       source: 前视角图像 + head crop
       target: 其余 N_tgt 视角图像 + mask（渲染监督）
-      SMPL-X 在前视角相机坐标系下，target c2w 为相对 source 的变换。
+      SMPL-X 与所有相机均保留在 4D-Dress 提供的世界坐标系中。
 
     Args:
         root_dirs:         已准备数据的根目录列表（prepare_4ddress.py 输出）
@@ -219,9 +194,9 @@ class Dress4DLHMDataset(BaseDataset):
         sample_side_views: 目标视角数，最多 3
         use_flame:         是否加载 FLAME 参数
         src_head_size:     head crop 边长，默认 112
-        multiply:          最终图像尺寸向下取整到的倍数，跟 ViT patch size 对齐
-        max_tgt_size:      预裁剪前的最长边缩放尺寸，对齐官方 preprocess_image
-        enlarge_ratio:      mask 裁剪框的随机放大范围，[1.0, 1.0] 即不做增强
+        multiply:          输出尺寸的 patch 对齐倍数
+        max_tgt_size:      crop 前的最长边尺寸
+        enlarge_ratio:     crop 随机放大范围
     """
 
     def __init__(
@@ -245,9 +220,9 @@ class Dress4DLHMDataset(BaseDataset):
         self.source_image_res = source_image_res
         self.render_image_res = (render_image or {}).get('high', (render_image or {}).get('low', 384))
         self.sample_side_views = sample_side_views
-        self.multiply          = multiply
-        self.max_tgt_size       = max_tgt_size
-        self.enlarge_ratio      = tuple(enlarge_ratio)
+        self.multiply = multiply
+        self.max_tgt_size = max_tgt_size
+        self.enlarge_ratio = tuple(enlarge_ratio)
         self.use_flame        = use_flame
         self.src_head_size    = src_head_size
 
@@ -343,19 +318,19 @@ class Dress4DLHMDataset(BaseDataset):
             'betas':      betas,
         }
 
-        # --- 相机外参（相对 c2w）---
+        # --- 相机外参（4D-Dress world c2w）---
+        # SMPL-X pkl、R/T 和所有 view 均已在同一世界坐标系中验证对齐。这里不能
+        # 以 source view 为原点重写 target camera；renderer 会自行将 c2w 求逆为 w2c。
         c2w_src = np.array(src_cam['c2w'], dtype=np.float64)
-        w2c_src = np.linalg.inv(c2w_src)
         render_c2ws = torch.stack([
-            torch.tensor(w2c_src @ np.array(cameras[cid]['c2w'], dtype=np.float64), dtype=torch.float32)
+            torch.tensor(np.array(cameras[cid]['c2w'], dtype=np.float64), dtype=torch.float32)
             for cid in tgt_cam_ids
         ])  # [N_tgt, 4, 4]
-        source_c2ws = torch.eye(4).unsqueeze(0)  # [1, 4, 4]
+        source_c2ws = torch.tensor(c2w_src, dtype=torch.float32).unsqueeze(0)
 
         render_bg_colors = torch.ones(N_tgt, 3)
 
-        # --- 图像 + mask + 内参：逐帧用 _load_view 动态裁剪（见函数注释），
-        # 内参由裁剪/缩放过程同步算出，不能像旧版那样跟图像加载分开算 ---
+        # --- 图像 + mask + 内参：LHM 原始 crop/resize，K 同步更新。---
         if self.raw_data_dir:
             raw_item = self._raw_item_dir(uid)
             src_cam_raw  = os.path.join(raw_item, 'Capture', src_cam_id)
@@ -420,3 +395,124 @@ class Dress4DLHMDataset(BaseDataset):
         if flame_params is not None:
             sample['flame_params'] = flame_params
         return sample
+
+
+class Dress4DLHMDataset(BaseDataset):
+    """LHM-Track 4D-Dress adapter.
+
+    ``root_dirs`` holds only Track metadata; images, cameras and SMPL-X stay
+    in ``raw_data_dir``.  Training consumes one ``#gNN`` target group, while
+    evaluation de-duplicates the groups and renders all 24 views.
+    """
+
+    def __init__(self, root_dirs, meta_path, raw_data_dir='', source_image_res=512,
+                 render_image=None, multiply=16, max_tgt_size=MAX_TGT_SIZE,
+                 enlarge_ratio=(1., 1.), eval_all_views=False, src_head_size=112,
+                 **kwargs):
+        super().__init__(root_dirs, meta_path)
+        self.root_dirs = [root_dirs] if isinstance(root_dirs, str) else list(root_dirs)
+        self.raw_data_dir = raw_data_dir
+        self.source_image_res = source_image_res
+        self.render_image_res = (render_image or {}).get('high', (render_image or {}).get('low', 384))
+        self.multiply, self.max_tgt_size = multiply, max_tgt_size
+        self.enlarge_ratio = tuple(enlarge_ratio)
+        self.eval_all_views, self.src_head_size = eval_all_views, src_head_size
+        with open(os.path.join(self.root_dirs[0], 'label', 'dataset_meta.json')) as f:
+            meta = json.load(f)
+        self.source_view = meta['source_views'][0]
+        self.target_groups = meta['target_view_groups']
+        self.all_views = [f'{index:02d}' for index in range(meta['view_count'])]
+        selected = kwargs.get('eval_sample_ids')
+        if selected is not None:
+            available = {entry.split('#', 1)[0] for entry in self.uids}
+            missing = [uid for uid in selected if uid not in available]
+            if missing:
+                raise ValueError(f'selected sample ids are not in prepared metadata: {missing[:10]}')
+            selected_set = set(selected)
+            self.uids = [entry for entry in self.uids if entry.split('#', 1)[0] in selected_set]
+        if eval_all_views:
+            self.uids = list(dict.fromkeys(uid.split('#', 1)[0] for uid in self.uids))
+
+    @staticmethod
+    def _parse_entry(entry):
+        uid, sep, group = entry.partition('#')
+        return uid, int(group[1:]) if sep else 0
+
+    def _face_bbox(self, uid):
+        for root in self.root_dirs:
+            path = os.path.join(root, 'face_bbox', f'{uid}.json')
+            if os.path.isfile(path):
+                with open(path) as f:
+                    return json.load(f)['bbox']
+        return None
+
+    def _head_crop(self, source_path, uid):
+        bbox = self._face_bbox(uid)
+        if bbox is None:
+            return torch.zeros(3, self.src_head_size, self.src_head_size)
+        image = cv2.imread(source_path)
+        if image is None:
+            raise FileNotFoundError(source_path)
+        x1, y1, x2, y2 = map(int, bbox)
+        h, w = image.shape[:2]
+        x1, x2, y1, y2 = max(0, x1), min(w, x2), max(0, y1), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError(f'invalid face bbox for {uid}: {bbox}')
+        crop = cv2.resize(image[y1:y2, x1:x2], (self.src_head_size, self.src_head_size), interpolation=cv2.INTER_AREA)
+        return torch.from_numpy(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.).permute(2, 0, 1)
+
+    @staticmethod
+    def _c2w(camera):
+        w2c = np.eye(4, dtype=np.float32)
+        w2c[:3, :3] = np.asarray(camera['R'], dtype=np.float32)
+        w2c[:3, 3] = np.asarray(camera['T'], dtype=np.float32)
+        return torch.from_numpy(np.linalg.inv(w2c).astype(np.float32))
+
+    @staticmethod
+    def _array(data, key, shape):
+        return torch.as_tensor(data[key], dtype=torch.float32).reshape(shape)
+
+    def inner_get_item(self, idx):
+        entry = self.uids[idx]
+        uid, group_index = self._parse_entry(entry)
+        sample_dir = os.path.join(self.raw_data_dir, uid)
+        with open(os.path.join(sample_dir, 'camera.json')) as f:
+            cameras = json.load(f)
+        with open(next(iter(sorted(glob.glob(os.path.join(sample_dir, 'smplx', '*.pkl'))))), 'rb') as f:
+            params = pickle.load(f)
+        target_views = self.all_views if self.eval_all_views else self.target_groups[group_index]
+        source_path = os.path.join(sample_dir, 'image', f'{self.source_view}.png')
+        source_mask = os.path.join(sample_dir, 'mask', f'{self.source_view}.png')
+        source_image, _, source_intr = _load_view(source_path, source_mask, np.asarray(cameras[self.source_view]['K']),
+                                                    self.source_image_res, self.multiply, max_tgt_size=self.max_tgt_size,
+                                                    enlarge_ratio=self.enlarge_ratio)
+        images, masks, intrs, c2ws = [], [], [], []
+        for view in target_views:
+            image, mask, intr = _load_view(os.path.join(sample_dir, 'image', f'{view}.png'),
+                                           os.path.join(sample_dir, 'mask', f'{view}.png'),
+                                           np.asarray(cameras[view]['K']), self.render_image_res, self.multiply,
+                                           max_tgt_size=self.max_tgt_size, enlarge_ratio=self.enlarge_ratio)
+            images.append(image); masks.append(mask); intrs.append(intr); c2ws.append(self._c2w(cameras[view]))
+        nv = len(target_views)
+        expand = lambda value: value.unsqueeze(0).expand(nv, *value.shape).clone()
+        smplx = {
+            'root_pose': expand(self._array(params, 'global_orient', (3,))),
+            'body_pose': expand(self._array(params, 'body_pose', (21, 3))),
+            'jaw_pose': expand(self._array(params, 'jaw_pose', (3,))),
+            'leye_pose': expand(self._array(params, 'leye_pose', (3,))),
+            'reye_pose': expand(self._array(params, 'reye_pose', (3,))),
+            'lhand_pose': expand(self._array(params, 'left_hand_pose', (12,))),
+            'rhand_pose': expand(self._array(params, 'right_hand_pose', (12,))),
+            'expr': expand(self._array(params, 'expression', (100,))),
+            'trans': expand(self._array(params, 'transl', (3,))),
+            'betas': self._array(params, 'betas', (10,)),
+        }
+        return {
+            'src_images': source_image.unsqueeze(0),
+            'source_head_rgbs': self._head_crop(source_path, uid).unsqueeze(0),
+            'render_images': torch.stack(images), 'render_masks': torch.stack(masks),
+            'render_c2ws': torch.stack(c2ws), 'render_intrs': torch.stack(intrs),
+            'source_c2ws': self._c2w(cameras[self.source_view]).unsqueeze(0),
+            'source_intrs': source_intr.unsqueeze(0), 'render_bg_colors': torch.ones(nv, 3),
+            'smplx_params': smplx, 'uid': uid, 'render_view_ids': target_views,
+        }
