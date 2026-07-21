@@ -196,11 +196,7 @@ class SapiensWrapper(nn.Module):
         if not USE_TORCHSCRIPT:
             raise NotImplementedError
         else:
-            # Let the owning LHM model / Accelerate move this scripted module
-            # exactly once.  Calling ``.cuda()`` here and then recursively
-            # moving the parent model in ``accelerator.prepare`` can crash the
-            # TorchScript CUDA runtime without a Python traceback.
-            model = model.float()
+            model = model.cuda()
         return model
 
     def _freeze(self):
@@ -222,17 +218,10 @@ class SapiensWrapper(nn.Module):
             image.shape[-1] // 16,
         )
 
-        # The released Sapiens .pt2 checkpoint is a TorchScript FP32 graph.
-        # In particular, its serialized Conv2d does not reliably participate
-        # in eager autocast under newer PyTorch versions.  Keep this frozen
-        # feature extractor in FP32; the surrounding LHM training may still
-        # use bf16 mixed precision.
-        # ``accelerate`` may have enabled an outer bf16 autocast context for
-        # the training step.  Disable it explicitly here: ``image.float()``
-        # alone is insufficient because Conv2d would otherwise be autocast
-        # again while executing this TorchScript graph.
-        with torch.no_grad(), torch.autocast(device_type="cuda", enabled=False):
-            (out_local,) = self.model(image.float())
+        with torch.no_grad(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16
+        ):
+            (out_local,) = self.model(image)
 
         out_global = None
         if out_global is not None:

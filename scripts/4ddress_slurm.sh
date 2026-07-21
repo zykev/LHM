@@ -14,7 +14,7 @@ conda activate lhm
 cd /home/zychen/Documents/LHM
 
 
-unset LD_LIBRARY_PATH
+unset LD_LIBRARY_PATH LD_PRELOAD
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
     --num_processes 4 \
