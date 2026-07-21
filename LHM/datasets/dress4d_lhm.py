@@ -501,6 +501,16 @@ class Dress4DLHMDataset(BaseDataset):
     def _array(data, key, shape):
         return torch.as_tensor(data[key], dtype=torch.float32).reshape(shape)
 
+    @staticmethod
+    def _pad_expression(expression):
+        """Pad 4D-Dress's 10-D expression coefficients for LHM-MINI."""
+        expression = torch.as_tensor(expression, dtype=torch.float32).reshape(-1)
+        if expression.numel() > 100:
+            raise ValueError(
+                f'expression has {expression.numel()} values; expected at most 100'
+            )
+        return torch.nn.functional.pad(expression, (0, 100 - expression.numel()))
+
     def inner_get_item(self, idx):
         entry = self.uids[idx]
         uid, group_index = self._parse_entry(entry)
@@ -539,7 +549,7 @@ class Dress4DLHMDataset(BaseDataset):
             'reye_pose': expand(self._array(params, 'reye_pose', (3,))),
             'lhand_pose': expand(self._array(params, 'left_hand_pose', (12,))),
             'rhand_pose': expand(self._array(params, 'right_hand_pose', (12,))),
-            'expr': expand(self._array(params, 'expression', (100,))),
+            'expr': expand(self._pad_expression(params['expression'])),
             'trans': expand(self._array(params, 'transl', (3,))),
             'betas': self._array(params, 'betas', (10,)),
         }
