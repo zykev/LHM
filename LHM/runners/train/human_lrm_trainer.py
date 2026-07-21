@@ -381,6 +381,14 @@ class HumanLRMTrainer(Runner):
         num_train_workers = dc.get('num_train_workers', 4)
         num_val_workers   = dc.get('num_val_workers', 2)
         pin_mem = dc.get('pin_mem', True)
+        if self.cfg.runtime.get('eval_only', False):
+            # CUDA/TorchScript modules have already been constructed by this
+            # point.  Forking DataLoader workers afterwards can segfault
+            # before Python reports an exception, so evaluation always loads
+            # samples in the main process.
+            num_train_workers = 0
+            num_val_workers = 0
+            logger.info('eval-only: DataLoader workers disabled to avoid CUDA fork')
 
         self.train_loader = DataLoader(
             self.train_dataset,
