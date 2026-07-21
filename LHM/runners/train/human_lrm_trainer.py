@@ -252,6 +252,13 @@ class HumanLRMTrainer(Runner):
                 logging.StreamHandler(sys.stdout),
             ],
         )
+        if self.cfg.runtime.get('eval_only', False):
+            # Evaluation writes its requested artifacts under --output-dir;
+            # do not create TensorBoard/W&B side effects or retain their
+            # background processes and image buffers.
+            self.writer = None
+            self.use_wandb = False
+            return
         if self.accelerator.is_main_process:
             tracker_root = os.path.join(self.exp_dir, 'trackers')
             os.makedirs(tracker_root, exist_ok=True)
@@ -267,6 +274,9 @@ class HumanLRMTrainer(Runner):
 
     def _setup_wandb(self):
         """Initialize wandb on main process if 'wandb' is in cfg.logger.trackers."""
+        if self.cfg.runtime.get('eval_only', False):
+            self.use_wandb = False
+            return
         trackers = self.cfg.logger.get('trackers', [])
         if 'wandb' not in trackers or not self.accelerator.is_main_process:
             self.use_wandb = False
@@ -369,19 +379,22 @@ class HumanLRMTrainer(Runner):
 
         subsets = OmegaConf.to_container(dc.subsets, resolve=True)
 
-        self.train_dataset = MixerDataset(
-            split='train', subsets=subsets, **dataset_kwargs
-        )
+        eval_only = self.cfg.runtime.get('eval_only', False)
+        self.train_dataset = None
+        if not eval_only:
+            self.train_dataset = MixerDataset(
+                split='train', subsets=subsets, **dataset_kwargs
+            )
         self.val_dataset = MixerDataset(
             split='val', subsets=subsets,
-            eval_all_views=self.cfg.runtime.get('eval_only', False),
+            eval_all_views=eval_only,
             **dataset_kwargs,
         )
 
         num_train_workers = dc.get('num_train_workers', 4)
         num_val_workers   = dc.get('num_val_workers', 2)
         pin_mem = dc.get('pin_mem', True)
-        if self.cfg.runtime.get('eval_only', False):
+        if eval_only:
             # CUDA/TorchScript modules have already been constructed by this
             # point.  Forking DataLoader workers afterwards can segfault
             # before Python reports an exception, so evaluation always loads
@@ -390,16 +403,18 @@ class HumanLRMTrainer(Runner):
             num_val_workers = 0
             logger.info('eval-only: DataLoader workers disabled to avoid CUDA fork')
 
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=self.cfg.train.batch_size,
-            shuffle=True,
-            num_workers=num_train_workers,
-            pin_memory=pin_mem,
-            collate_fn=collate_fn_skip_none,
-            drop_last=True,
-            persistent_workers=num_train_workers > 0,
-        )
+        self.train_loader = None
+        if not eval_only:
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.cfg.train.batch_size,
+                shuffle=True,
+                num_workers=num_train_workers,
+                pin_memory=pin_mem,
+                collate_fn=collate_fn_skip_none,
+                drop_last=True,
+                persistent_workers=num_train_workers > 0,
+            )
         self.val_loader = DataLoader(
             self.val_dataset,
             batch_size=self.cfg.val.get('batch_size', 2),
@@ -409,12 +424,30 @@ class HumanLRMTrainer(Runner):
             collate_fn=collate_fn_skip_none,
             drop_last=False,
         )
-        logger.info(f'训练集: {len(self.train_dataset)} 样本; '
-                    f'验证集: {len(self.val_dataset)} 样本')
+        if eval_only:
+            logger.info(f'eval-only: 验证集 {len(self.val_dataset)} 样本')
+        else:
+            logger.info(f'训练集: {len(self.train_dataset)} 样本; '
+                        f'验证集: {len(self.val_dataset)} 样本')
 
     # ── Optimizer / Scheduler ───────────────────────────────────────────────
 
     def _setup_optimizer(self):
+        if self.cfg.runtime.get('eval_only', False):
+            # Evaluation has no backward pass, optimizer, scheduler, or
+            # training loader requirement.  Preparing only the model and
+            # validation loader avoids redundant CUDA state and keeps the
+            # TorchScript Sapiens module's device move to one controlled step.
+            logger.info('eval-only: preparing model and validation loader only')
+            self.model, self.val_loader = self.accelerator.prepare(
+                self.model, self.val_loader
+            )
+            logger.info('eval-only: Accelerator preparation complete')
+            self.optimizer = None
+            self.scheduler = None
+            self.train_loader = None
+            return
+
         oc = self.cfg.train.optim
 
         if hasattr(self.model, 'obtain_params'):
@@ -565,8 +598,10 @@ class HumanLRMTrainer(Runner):
         device = self.accelerator.device
         lfc    = self.cfg.train.loss_func
 
-        self.pixel_loss     = PixelLoss(option=lfc.get('pixel_loss', 'l1'))
         self.perceptual_loss = LPIPSLoss(device=device, prefech=False)
+        if self.cfg.runtime.get('eval_only', False):
+            return
+        self.pixel_loss     = PixelLoss(option=lfc.get('pixel_loss', 'l1'))
 
         # ASAP（ball） loss：限制 GS 缩放各向同性
         ball_cfg = lfc.get('ball_loss', {})
@@ -625,6 +660,8 @@ class HumanLRMTrainer(Runner):
             os.remove(old)
 
     def _resume_if_needed(self):
+        if self.cfg.runtime.get('eval_only', False):
+            return
         if not self.cfg.saver.get('auto_resume', True):
             return
         ckpt_dir = self._ckpt_dir()
@@ -840,6 +877,12 @@ class HumanLRMTrainer(Runner):
         self.model.eval()
         device  = self.accelerator.device
         val_cfg = self.cfg.val
+        eval_only = self.cfg.runtime.get('eval_only', False)
+        if eval_only:
+            logger.info(
+                f'eval-only: evaluating {len(self.val_dataset)} sample(s); '
+                f'save_render={self.cfg.runtime.get("save_render", False)}'
+            )
         n_debug = 0 if self.cfg.runtime.get('eval_only', False) else val_cfg.get('debug_batches', 10)
         img_mon = self.cfg.logger.get('image_monitor', {})
         n_log   = img_mon.get('samples_per_log', 2)
@@ -856,6 +899,8 @@ class HumanLRMTrainer(Runner):
                 continue
             if n_debug and i >= n_debug:
                 break
+            if eval_only:
+                logger.info(f'eval-only: rendering batch {i + 1}')
 
             smplx_params = {
                 k: v.to(device) for k, v in batch['smplx_params'].items()
@@ -871,6 +916,8 @@ class HumanLRMTrainer(Runner):
                     render_bg_colors = batch['render_bg_colors'].to(device),
                     smplx_params     = smplx_params,
                     source_head_rgbs = batch['source_head_rgbs'].to(device),
+                    render_height    = batch['render_images'].shape[-2],
+                    render_width     = batch['render_images'].shape[-1],
                     df_data          = None,
                 )
 
@@ -879,7 +926,10 @@ class HumanLRMTrainer(Runner):
                 'render_masks':     batch['render_masks'].to(device),
                 'source_head_rgbs': batch['source_head_rgbs'].to(device),
             }
-            losses = self._compute_losses(render_out, batch_dev)
+            losses = (
+                {} if self.cfg.runtime.get('eval_only', False)
+                else self._compute_losses(render_out, batch_dev)
+            )
             for k, v in losses.items():
                 agg[k] += v.item() if isinstance(v, torch.Tensor) else v
             for k, v in self._compute_eval_metrics(render_out, batch_dev).items():
@@ -889,14 +939,18 @@ class HumanLRMTrainer(Runner):
             if self.cfg.runtime.get('save_render', False) and self.accelerator.is_main_process:
                 self._save_eval_renders(render_out, batch)
 
-            # Keep the first batch for image logging
-            if first_render_out is None:
+            # Keep the first batch only for training-time image logging.  In
+            # eval-only this would retain all 24 rendered views on GPU for no
+            # output benefit.
+            if (not self.cfg.runtime.get('eval_only', False)
+                    and first_render_out is None):
                 first_render_out = {k: v.detach() for k, v in render_out.items()
                                     if isinstance(v, torch.Tensor)}
                 first_batch     = batch
                 first_batch_dev = batch_dev
 
-        self.model.train()
+        if not self.cfg.runtime.get('eval_only', False):
+            self.model.train()
 
         # accelerator.prepare() 之后 val_loader 会把验证集切分到各 rank，每个 rank
         # 上面这段循环只跑到了自己那一份 shard。这里用固定 key 的 tensor 做一次
@@ -917,15 +971,17 @@ class HumanLRMTrainer(Runner):
         if global_count == 0:
             return {}
 
-        avg = {k: stats[i].item() / global_count for i, k in enumerate(_LOSS_KEYS)}
-        avg['total'] = sum(avg.values())
-        avg.update({
+        avg = {
             k: stats[n_loss + i].item() / global_count for i, k in enumerate(_METRIC_KEYS)
-        })
+        }
+        if not self.cfg.runtime.get('eval_only', False):
+            losses_avg = {k: stats[i].item() / global_count for i, k in enumerate(_LOSS_KEYS)}
+            avg = {**losses_avg, 'total': sum(losses_avg.values()), **avg}
 
-        self._log_scalars(avg, 'val', self.global_step)
+        if not self.cfg.runtime.get('eval_only', False):
+            self._log_scalars(avg, 'val', self.global_step)
 
-        if first_render_out is not None:
+        if first_render_out is not None and not self.cfg.runtime.get('eval_only', False):
             self._log_images_wandb(
                 first_render_out, first_batch, first_batch_dev,
                 prefix='val', n_log=n_log,

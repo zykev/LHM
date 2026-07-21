@@ -86,7 +86,7 @@ dataset:
   # 原始 4DDress 数据路径（Dataset 直接从此处读取各视角图像）
   # LHM 与 LHM_Track 位于同一父目录时的默认路径。若部署不同，运行脚本时
   # 传入 --dataset-root /absolute/path/to/4d-dress 覆盖即可。
-  raw_data_dir: ".datasets/4d-dress"
+  raw_data_dir: "../LHM_Track/.datasets/4d-dress"
 
   source_image_res: 512
   render_image:

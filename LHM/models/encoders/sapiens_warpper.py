@@ -196,8 +196,11 @@ class SapiensWrapper(nn.Module):
         if not USE_TORCHSCRIPT:
             raise NotImplementedError
         else:
-            dtype = torch.float32  # TorchScript models use float32
-            model = model.cuda()
+            # Let the owning LHM model / Accelerate move this scripted module
+            # exactly once.  Calling ``.cuda()`` here and then recursively
+            # moving the parent model in ``accelerator.prepare`` can crash the
+            # TorchScript CUDA runtime without a Python traceback.
+            model = model.float()
         return model
 
     def _freeze(self):
