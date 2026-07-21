@@ -505,7 +505,14 @@ class Dress4DLHMDataset(BaseDataset):
         entry = self.uids[idx]
         uid, group_index = self._parse_entry(entry)
         sample_dir = os.path.join(self.raw_data_dir, uid)
-        with open(os.path.join(sample_dir, 'camera.json')) as f:
+        camera_path = os.path.join(sample_dir, 'camera.json')
+        if not os.path.isfile(camera_path):
+            raise FileNotFoundError(
+                f'4D-Dress sample is not available at {camera_path}. '
+                'The expected layout is <dataset-root>/<group>/<sample>/camera.json. '
+                'Set --dataset-root to the 4d-dress root used by LHM_Track prepare.'
+            )
+        with open(camera_path) as f:
             cameras = json.load(f)
         with open(next(iter(sorted(glob.glob(os.path.join(sample_dir, 'smplx', '*.pkl'))))), 'rb') as f:
             params = pickle.load(f)

@@ -72,10 +72,10 @@ dataset:
     - name: dress4d_lhm
       # root_dirs：prepare_4ddress.py 的 output_dir（已处理数据）
       root_dirs:
-        - /home/zychen/Documents/LHM_Track/train_data/4ddress_lhm
+        - ../LHM_Track/train_data/4ddress_lhm
       meta_path:
-        train: /home/zychen/Documents/LHM_Track/train_data/4ddress_lhm/label/train_list.json
-        val:   /home/zychen/Documents/LHM_Track/train_data/4ddress_lhm/label/val_list.json
+        train: ../LHM_Track/train_data/4ddress_lhm/label/train_list.json
+        val:   ../LHM_Track/train_data/4ddress_lhm/label/val_list.json
       sample_rate: 1.0
       use_flame: false        # 若 prepare_4ddress.py 已跑 flame，可改为 true
       src_head_size: 112
@@ -84,6 +84,8 @@ dataset:
   sample_side_views: 4
 
   # 原始 4DDress 数据路径（Dataset 直接从此处读取各视角图像）
+  # LHM 与 LHM_Track 位于同一父目录时的默认路径。若部署不同，运行脚本时
+  # 传入 --dataset-root /absolute/path/to/4d-dress 覆盖即可。
   raw_data_dir: ".datasets/4d-dress"
 
   source_image_res: 512
