@@ -14,4 +14,5 @@ CUDA_VISIBLE_DEVICES=1 python -m LHM.launch train.human_lrm \
     --eval-only \
     --save-render \
     --checkpoint pretrained \
+    --output-dir ./outputs/4ddress_one \
     "$@"
