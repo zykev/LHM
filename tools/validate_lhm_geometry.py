@@ -32,7 +32,7 @@ from LHM.datasets.dress4d_lhm import (
 
 
 def lhm_crop(image_bgr, mask, intrinsic, target_width, multiply=16,
-             return_transform=False):
+             return_transform=False, aspect_hw=ASPECT_HW):
     """Same image/mask/K transform used by Dress4DLHMDataset.
 
     When ``return_transform`` is true, also return the exact image-space
@@ -40,7 +40,7 @@ def lhm_crop(image_bgr, mask, intrinsic, target_width, multiply=16,
     to test that projecting with the updated K is equivalent to projecting in
     the raw image and then applying the crop transform.
     """
-    target_h, target_w = _calc_tgt_hw(ASPECT_HW, target_width, multiply)
+    target_h, target_w = _calc_tgt_hw(aspect_hw, target_width, multiply)
     raw_h, raw_w = image_bgr.shape[:2]
     image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     mask = mask.astype(np.float32)
@@ -50,7 +50,9 @@ def lhm_crop(image_bgr, mask, intrinsic, target_width, multiply=16,
     mask, _ = _resize_keepaspect(mask, MAX_TGT_SIZE)
     k[0, 0] *= ratio; k[0, 2] *= ratio
     k[1, 1] *= ratio; k[1, 2] *= ratio
-    image, mask, off_x, off_y = _center_crop_by_mask(image, mask, k[0, 2], k[1, 2], ASPECT_HW)
+    image, mask, off_x, off_y = _center_crop_by_mask(
+        image, mask, k[0, 2], k[1, 2], aspect_hw
+    )
     k[0, 2] -= off_x; k[1, 2] -= off_y
     h, w = image.shape[:2]
     sy, sx = target_h / h, target_w / w
@@ -64,6 +66,7 @@ def lhm_crop(image_bgr, mask, intrinsic, target_width, multiply=16,
         return image, mask > .5, k
     transform = {
         'raw_hw': (raw_h, raw_w),
+        'aspect_hw': float(aspect_hw),
         # These are deliberately the same factors used to update K.
         'pre_resize_scale': float(ratio),
         'crop_offset_xy': (int(off_x), int(off_y)),
@@ -238,8 +241,12 @@ def main():
     parser.add_argument('--model-path', default='./pretrained_models/human_model_files')
     parser.add_argument('--output-dir', default='./outputs/geometry_check')
     parser.add_argument('--render-width', type=int, default=384)
+    parser.add_argument('--aspect-hw', type=float, default=ASPECT_HW,
+                        help='Crop/output H/W ratio; default matches LHM training (5/3).')
     parser.add_argument('--device', default='cuda')
     args = parser.parse_args()
+    if args.aspect_hw <= 0:
+        raise ValueError('--aspect-hw must be positive')
 
     cameras, params, image_path, mask_path, pca = load_sample(args.dataset, args.root, args.sample_id)
     vertices, faces = forward_vertices(params, pca, args.model_path, args.device)
@@ -258,7 +265,8 @@ def main():
                     if mask_path else ~np.all(bgr >= 245, axis=-1))
         raw_k = np.asarray(cameras[view]['K'], dtype=np.float32)
         image, gt_mask, k, transform = lhm_crop(
-            bgr, raw_mask, raw_k, args.render_width, return_transform=True
+            bgr, raw_mask, raw_k, args.render_width,
+            return_transform=True, aspect_hw=args.aspect_hw,
         )
         smpl_mask = silhouette(vertices, faces, cameras[view], k, image.shape[0], image.shape[1])
         errors = projection_errors(vertices, cameras[view], raw_k, k, transform)
@@ -286,6 +294,7 @@ def main():
     summary = {
         'dataset': args.dataset,
         'sample_id': args.sample_id,
+        'crop_aspect_hw': args.aspect_hw,
         'huge_scale_used': False if args.dataset == 'huge100k' else None,
         'mean_silhouette_iou': float(np.mean([row['silhouette_iou'] for row in rows])),
         'mean_dataset_k_affine_error_px': float(np.mean(affine_means)),
