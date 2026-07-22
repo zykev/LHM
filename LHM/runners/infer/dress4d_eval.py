@@ -213,7 +213,10 @@ def evaluate_4ddress(inferrer) -> None:
         backgrounds = torch.ones(1, len(frames), 3, device=device)
 
         gs_models, query_points, transform = model.infer_single_view(
-            source_image.unsqueeze(0).to(device), source_head.unsqueeze(0).to(device),
+            # Official inference expects [B, N_ref, C, H, W].  4D-Dress has
+            # one fixed source view, hence both leading dimensions are one.
+            source_image.unsqueeze(0).unsqueeze(0).to(device),
+            source_head.unsqueeze(0).unsqueeze(0).to(device),
             None, None, render_c2ws, render_intrs, backgrounds, smplx,
         )
         smplx["transform_mat_neutral_pose"] = transform
