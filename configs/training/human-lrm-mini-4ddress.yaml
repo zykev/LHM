@@ -89,6 +89,9 @@ dataset:
   raw_data_dir: "../LHM_Track/.datasets/4d-dress"
 
   source_image_res: 512
+  # 4D-Dress contains wide T-pose / raised-arm frames.  A square crop keeps
+  # the horizontal field of view instead of truncating limbs for a 5:3 crop.
+  crop_aspect_hw: 1.0
   render_image:
     low: 384
     high: 384

@@ -408,6 +408,7 @@ class Dress4DLHMDataset(BaseDataset):
     def __init__(self, root_dirs, meta_path, raw_data_dir='', source_image_res=512,
                  render_image=None, multiply=16, max_tgt_size=MAX_TGT_SIZE,
                  enlarge_ratio=(1., 1.), eval_all_views=False, src_head_size=112,
+                 crop_aspect_hw=ASPECT_HW,
                  **kwargs):
         super().__init__(root_dirs, meta_path)
         self.root_dirs = [root_dirs] if isinstance(root_dirs, str) else list(root_dirs)
@@ -416,6 +417,9 @@ class Dress4DLHMDataset(BaseDataset):
         self.render_image_res = (render_image or {}).get('high', (render_image or {}).get('low', 384))
         self.multiply, self.max_tgt_size = multiply, max_tgt_size
         self.enlarge_ratio = tuple(enlarge_ratio)
+        self.crop_aspect_hw = float(crop_aspect_hw)
+        if self.crop_aspect_hw <= 0:
+            raise ValueError(f'crop_aspect_hw must be positive, got {crop_aspect_hw}')
         self.eval_all_views, self.src_head_size = eval_all_views, src_head_size
         with open(os.path.join(self.root_dirs[0], 'label', 'dataset_meta.json')) as f:
             meta = json.load(f)
@@ -531,13 +535,16 @@ class Dress4DLHMDataset(BaseDataset):
         source_mask = os.path.join(sample_dir, 'mask', f'{self.source_view}.png')
         source_image, _, source_intr = _load_view(source_path, source_mask, np.asarray(cameras[self.source_view]['K']),
                                                     self.source_image_res, self.multiply, max_tgt_size=self.max_tgt_size,
-                                                    enlarge_ratio=self.enlarge_ratio)
+                                                    enlarge_ratio=self.enlarge_ratio,
+                                                    aspect_standard=self.crop_aspect_hw)
         images, masks, intrs, c2ws = [], [], [], []
         for view in target_views:
             image, mask, intr = _load_view(os.path.join(sample_dir, 'image', f'{view}.png'),
                                            os.path.join(sample_dir, 'mask', f'{view}.png'),
                                            np.asarray(cameras[view]['K']), self.render_image_res, self.multiply,
-                                           max_tgt_size=self.max_tgt_size, enlarge_ratio=self.enlarge_ratio)
+                                           max_tgt_size=self.max_tgt_size,
+                                           enlarge_ratio=self.enlarge_ratio,
+                                           aspect_standard=self.crop_aspect_hw)
             images.append(image); masks.append(mask); intrs.append(intr); c2ws.append(self._c2w(cameras[view]))
         nv = len(target_views)
         expand = lambda value: value.unsqueeze(0).expand(nv, *value.shape).clone()
