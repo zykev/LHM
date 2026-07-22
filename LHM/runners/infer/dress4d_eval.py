@@ -156,6 +156,11 @@ def evaluate_4ddress(inferrer) -> None:
         raise FileNotFoundError(f"metadata_root={metadata_root}, dataset_root={dataset_root}")
 
     device = inferrer.device
+    # ``HumanLRMInferrer`` normally constructs this in ``__init__``.  Keep
+    # the evaluator robust to older runners that initialise the official
+    # inference object before the 4D-Dress mode is injected.
+    if inferrer.model is None:
+        inferrer.model = inferrer._build_model(cfg).to(device)
     model = inferrer.model.eval().to(dtype=torch.float32)
     perceptual = LPIPSLoss(device=device, prefech=False)
     per_sample = {}
@@ -226,4 +231,3 @@ def evaluate_4ddress(inferrer) -> None:
     with (output_root / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump({"mean": mean, "samples": per_sample}, handle, indent=2)
     print("mean: " + ", ".join(f"{key}={value:.4f}" for key, value in mean.items()))
-
