@@ -160,8 +160,13 @@ def evaluate_4ddress(inferrer) -> None:
     # the evaluator robust to older runners that initialise the official
     # inference object before the 4D-Dress mode is injected.
     if inferrer.model is None:
-        inferrer.model = inferrer._build_model(cfg).to(device)
-    model = inferrer.model.eval().to(dtype=torch.float32)
+        inferrer.model = inferrer._build_model(cfg)
+        if inferrer.model is None:
+            raise RuntimeError("failed to construct the 4D-Dress inference model")
+        inferrer.model.to(device)
+    model = inferrer.model
+    model.eval()
+    model.to(dtype=torch.float32)
     perceptual = LPIPSLoss(device=device, prefech=False)
     per_sample = {}
 

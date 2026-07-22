@@ -409,7 +409,13 @@ class HumanLRMInferrer(Inferrer):
             except:
                 self.parsingnet = None
 
-        self.model: ModelHumanLRM = self._build_model(self.cfg).to(self.device)
+        # Keep the assignment separate from ``Module.to``.  Some wrapped
+        # inference modules do not return ``self`` from ``to()``, and assigning
+        # that return value would silently replace the loaded model with None.
+        self.model: ModelHumanLRM = self._build_model(self.cfg)
+        if self.model is None:
+            raise RuntimeError("failed to construct the LHM inference model")
+        self.model.to(self.device)
 
         self.motion_dict = dict()
 
