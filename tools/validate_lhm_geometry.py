@@ -31,9 +31,17 @@ from LHM.datasets.dress4d_lhm import (
 )
 
 
-def lhm_crop(image_bgr, mask, intrinsic, target_width, multiply=16):
-    """Same image/mask/K transform used by Dress4DLHMDataset."""
+def lhm_crop(image_bgr, mask, intrinsic, target_width, multiply=16,
+             return_transform=False):
+    """Same image/mask/K transform used by Dress4DLHMDataset.
+
+    When ``return_transform`` is true, also return the exact image-space
+    affine transform used by the dataset's K update.  This makes it possible
+    to test that projecting with the updated K is equivalent to projecting in
+    the raw image and then applying the crop transform.
+    """
     target_h, target_w = _calc_tgt_hw(ASPECT_HW, target_width, multiply)
+    raw_h, raw_w = image_bgr.shape[:2]
     image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     mask = mask.astype(np.float32)
     image = image * mask[..., None] + (1.0 - mask[..., None])
@@ -52,7 +60,18 @@ def lhm_crop(image_bgr, mask, intrinsic, target_width, multiply=16):
     k[1, 1] *= sy; k[1, 2] *= sy
     if not np.allclose(k[:2, 2], [target_w / 2, target_h / 2], rtol=0, atol=1e-4):
         raise ValueError(f'LHM crop did not center principal point: {k[:2, 2]}')
-    return image, mask > .5, k
+    if not return_transform:
+        return image, mask > .5, k
+    transform = {
+        'raw_hw': (raw_h, raw_w),
+        # These are deliberately the same factors used to update K.
+        'pre_resize_scale': float(ratio),
+        'crop_offset_xy': (int(off_x), int(off_y)),
+        'crop_hw': (int(h), int(w)),
+        'final_resize_scale_xy': (float(sx), float(sy)),
+        'output_hw': (target_h, target_w),
+    }
+    return image, mask > .5, k, transform
 
 
 def find_huge_param(root, sample_id):
@@ -130,11 +149,7 @@ def forward_vertices(params, pca, model_path, device):
 
 
 def silhouette(vertices, faces, camera, intrinsic, height, width):
-    r, t = np.asarray(camera['R'], np.float32), np.asarray(camera['T'], np.float32)
-    points = vertices @ r.T + t
-    z = points[:, 2]
-    uvw = points @ intrinsic.T
-    uv = uvw[:, :2] / np.maximum(uvw[:, 2:3], 1e-8)
+    uv, z = project_vertices(vertices, camera, intrinsic)
     out = np.zeros((height, width), np.uint8)
     for face in faces:
         if np.any(z[face] <= 1e-6):
@@ -142,6 +157,70 @@ def silhouette(vertices, faces, camera, intrinsic, height, width):
         triangle = np.rint(uv[face]).astype(np.int32)
         cv2.fillConvexPoly(out, triangle, 1)
     return out.astype(bool)
+
+
+def project_vertices(vertices, camera, intrinsic):
+    """Project vertices in the raw or cropped image coordinate system."""
+    r = np.asarray(camera['R'], np.float32)
+    t = np.asarray(camera['T'], np.float32)
+    points = vertices @ r.T + t
+    uvw = points @ np.asarray(intrinsic, np.float32).T
+    uv = uvw[:, :2] / np.maximum(uvw[:, 2:3], 1e-8)
+    return uv, points[:, 2]
+
+
+def apply_lhm_crop_transform(uv, transform, pixel_center=False):
+    """Map raw projected pixels to the final LHM crop coordinates.
+
+    ``pixel_center=False`` reproduces the K update in the dataset exactly.
+    ``pixel_center=True`` additionally applies OpenCV's half-pixel resize
+    convention, which quantifies the small sub-pixel discrepancy omitted by
+    the conventional ``K *= scale`` camera update.
+    """
+    result = np.asarray(uv, np.float64).copy()
+    pre_scale = transform['pre_resize_scale']
+    sx, sy = transform['final_resize_scale_xy']
+    off_x, off_y = transform['crop_offset_xy']
+    if pixel_center:
+        result[:, 0] = (result[:, 0] + 0.5) * pre_scale - 0.5
+        result[:, 1] = (result[:, 1] + 0.5) * pre_scale - 0.5
+    else:
+        result *= pre_scale
+    result[:, 0] -= off_x
+    result[:, 1] -= off_y
+    if pixel_center:
+        result[:, 0] = (result[:, 0] + 0.5) * sx - 0.5
+        result[:, 1] = (result[:, 1] + 0.5) * sy - 0.5
+    else:
+        result[:, 0] *= sx
+        result[:, 1] *= sy
+    return result
+
+
+def projection_errors(vertices, camera, raw_k, cropped_k, transform):
+    """Compare raw-projection-plus-crop against direct cropped-K projection."""
+    raw_uv, depth = project_vertices(vertices, camera, raw_k)
+    cropped_uv, _ = project_vertices(vertices, camera, cropped_k)
+    valid = depth > 1e-6
+    expected_uv = apply_lhm_crop_transform(raw_uv[valid], transform)
+    pixel_center_uv = apply_lhm_crop_transform(
+        raw_uv[valid], transform, pixel_center=True
+    )
+
+    def summary(lhs, rhs):
+        distances = np.linalg.norm(lhs - rhs, axis=1)
+        return {
+            'mean_px': float(distances.mean()),
+            'max_px': float(distances.max()),
+            'p99_px': float(np.quantile(distances, 0.99)),
+        }
+
+    return {
+        # This must be near numerical zero. A non-zero value is a K-update bug.
+        'dataset_k_affine_error': summary(expected_uv, cropped_uv[valid]),
+        # This reports only OpenCV resize pixel-centre convention drift.
+        'opencv_pixel_center_error': summary(pixel_center_uv, cropped_uv[valid]),
+    }
 
 
 def draw_contour(image, mask, color):
@@ -166,6 +245,8 @@ def main():
     vertices, faces = forward_vertices(params, pca, args.model_path, args.device)
     output = Path(args.output_dir) / args.dataset / args.sample_id
     output.mkdir(parents=True, exist_ok=True)
+    raw_output = output / 'raw'
+    raw_output.mkdir(exist_ok=True)
     rows = []
     for index in range(24):
         view = f'{index:02d}'
@@ -175,8 +256,12 @@ def main():
         # Keep this threshold identical to the LHM dataset loader.
         raw_mask = (cv2.imread(str(mask_path(view)), cv2.IMREAD_GRAYSCALE) > 127
                     if mask_path else ~np.all(bgr >= 245, axis=-1))
-        image, gt_mask, k = lhm_crop(bgr, raw_mask, np.asarray(cameras[view]['K']), args.render_width)
+        raw_k = np.asarray(cameras[view]['K'], dtype=np.float32)
+        image, gt_mask, k, transform = lhm_crop(
+            bgr, raw_mask, raw_k, args.render_width, return_transform=True
+        )
         smpl_mask = silhouette(vertices, faces, cameras[view], k, image.shape[0], image.shape[1])
+        errors = projection_errors(vertices, cameras[view], raw_k, k, transform)
         union = np.logical_or(gt_mask, smpl_mask).sum()
         iou = float(np.logical_and(gt_mask, smpl_mask).sum() / union) if union else 1.0
         # Red is the cropped GT mask boundary; green is the projected SMPL-X
@@ -184,10 +269,29 @@ def main():
         overlay = draw_contour((image * 255).astype(np.uint8), gt_mask, (255, 0, 0))
         overlay = draw_contour(overlay, smpl_mask, (0, 255, 0))
         cv2.imwrite(str(output / f'{view}.png'), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-        rows.append({'view': view, 'silhouette_iou': iou, 'K': k.tolist()})
-    summary = {'dataset': args.dataset, 'sample_id': args.sample_id,
-               'huge_scale_used': False if args.dataset == 'huge100k' else None,
-               'mean_silhouette_iou': float(np.mean([row['silhouette_iou'] for row in rows])), 'views': rows}
+        raw_image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        raw_overlay = draw_contour(raw_image, raw_mask, (255, 0, 0))
+        raw_smpl_mask = silhouette(vertices, faces, cameras[view], raw_k, *bgr.shape[:2])
+        raw_overlay = draw_contour(raw_overlay, raw_smpl_mask, (0, 255, 0))
+        cv2.imwrite(str(raw_output / f'{view}.png'), cv2.cvtColor(raw_overlay, cv2.COLOR_RGB2BGR))
+        rows.append({
+            'view': view,
+            'silhouette_iou': iou,
+            'K': k.tolist(),
+            'crop_transform': transform,
+            'projection_error': errors,
+        })
+    affine_means = [row['projection_error']['dataset_k_affine_error']['mean_px'] for row in rows]
+    affine_maxes = [row['projection_error']['dataset_k_affine_error']['max_px'] for row in rows]
+    summary = {
+        'dataset': args.dataset,
+        'sample_id': args.sample_id,
+        'huge_scale_used': False if args.dataset == 'huge100k' else None,
+        'mean_silhouette_iou': float(np.mean([row['silhouette_iou'] for row in rows])),
+        'mean_dataset_k_affine_error_px': float(np.mean(affine_means)),
+        'max_dataset_k_affine_error_px': float(np.max(affine_maxes)),
+        'views': rows,
+    }
     with (output / 'summary.json').open('w') as handle:
         json.dump(summary, handle, indent=2)
     print(json.dumps(summary, indent=2))
