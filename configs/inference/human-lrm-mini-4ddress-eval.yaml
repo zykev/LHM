@@ -1,0 +1,13 @@
+# This is consumed by the official ``infer.human_lrm`` runner.  It does not
+# use the training Dataset or trainer; Track manifests provide the 24 targets.
+input_mode: 4ddress_eval
+crop_aspect_hw: 1.0
+source_size: 512
+render_size: 384
+src_head_size: 112
+max_tgt_size: 896
+multiply: 16
+metadata_root: ../LHM_Track/train_data/4ddress_lhm
+dataset_root: ../LHM_Track/.datasets/4d-dress
+output_dir: ./outputs/4ddress_eval
+save_render: false

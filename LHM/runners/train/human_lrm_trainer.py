@@ -172,38 +172,43 @@ class HumanLRMTrainer(Runner):
 
     @staticmethod
     def _load_config() -> DictConfig:
-        """Load config plus evaluation-only dataset/checkpoint overrides."""
+        """Load training config and optional 4D-Dress sample selections."""
         import argparse
         parser = argparse.ArgumentParser()
         parser.add_argument('--config', type=str, required=True)
-        parser.add_argument('--eval-only', action='store_true')
-        parser.add_argument('--checkpoint', default=None,
-                            help='local .pth checkpoint, or "pretrained" (LHM-MINI)')
-        parser.add_argument('--save-render', action='store_true')
-        parser.add_argument('--output-dir', default=None)
-        parser.add_argument('--mixed-precision', choices=('no', 'fp16', 'bf16'), default=None,
-                            help='override Accelerator precision; use "no" for FP32 evaluation')
         parser.add_argument('--dataset-root', default=None,
-                            help='raw dataset root used by an evaluation adapter')
+                            help='override the raw 4D-Dress dataset root')
         parser.add_argument('--metadata-root', default=None,
-                            help='LHM-Track prepare output root used by an evaluation adapter')
+                            help='override the LHM-Track prepare output root')
         parser.add_argument('--sample-id', action='append',
-                            help='evaluate one prepared sample id (can be repeated)')
+                            help='train/validate only these prepared sample ids (repeatable)')
         parser.add_argument('--sample-list', default=None,
-                            help='newline-delimited prepared sample IDs to evaluate')
+                            help='newline-delimited sample ids used for both training and validation')
+        parser.add_argument('--train-list', default=None,
+                            help='newline-delimited sample ids for the training split')
+        parser.add_argument('--test-list', default=None,
+                            help='newline-delimited sample ids for the validation split')
         args, _ = parser.parse_known_args()
+
+        def read_ids(path, flag):
+            with open(path, encoding='utf-8') as handle:
+                values = [line.split('#', 1)[0].strip() for line in handle]
+            values = [value for value in values if value]
+            if not values:
+                parser.error(f'{flag} is empty')
+            return values
+
         if args.sample_id and args.sample_list:
             parser.error('use --sample-id or --sample-list, not both')
-        selected_ids = args.sample_id
-        if args.sample_list:
-            with open(args.sample_list) as handle:
-                selected_ids = [line.split('#', 1)[0].strip() for line in handle]
-            selected_ids = [item for item in selected_ids if item]
-            if not selected_ids:
-                parser.error('--sample-list is empty')
+        if (args.train_list is None) != (args.test_list is None):
+            parser.error('--train-list and --test-list must be provided together')
+        if (args.sample_id or args.sample_list) and args.train_list:
+            parser.error('sample selection cannot be combined with --train-list/--test-list')
+
+        shared_ids = args.sample_id or (read_ids(args.sample_list, '--sample-list') if args.sample_list else None)
+        train_ids = read_ids(args.train_list, '--train-list') if args.train_list else shared_ids
+        val_ids = read_ids(args.test_list, '--test-list') if args.test_list else shared_ids
         cfg = OmegaConf.load(args.config)
-        if args.mixed_precision is not None:
-            cfg.train.mixed_precision = args.mixed_precision
         if args.dataset_root:
             cfg.dataset.raw_data_dir = args.dataset_root
         if args.metadata_root:
@@ -211,13 +216,12 @@ class HumanLRMTrainer(Runner):
                 subset.root_dirs = [args.metadata_root]
                 subset.meta_path.train = os.path.join(args.metadata_root, 'label', 'train_list.json')
                 subset.meta_path.val = os.path.join(args.metadata_root, 'label', 'val_list.json')
-        if selected_ids is not None:
-            cfg.dataset.eval_sample_ids = selected_ids
+        if train_ids is not None:
+            cfg.dataset.train_sample_ids = train_ids
+        if val_ids is not None:
+            cfg.dataset.val_sample_ids = val_ids
         cfg.runtime = {
-            'eval_only': args.eval_only,
-            'checkpoint': args.checkpoint,
-            'save_render': args.save_render,
-            'output_dir': args.output_dir,
+            'train_only': True,
         }
         return cfg
 
@@ -252,13 +256,6 @@ class HumanLRMTrainer(Runner):
                 logging.StreamHandler(sys.stdout),
             ],
         )
-        if self.cfg.runtime.get('eval_only', False):
-            # Evaluation writes its requested artifacts under --output-dir;
-            # do not create TensorBoard/W&B side effects or retain their
-            # background processes and image buffers.
-            self.writer = None
-            self.use_wandb = False
-            return
         if self.accelerator.is_main_process:
             tracker_root = os.path.join(self.exp_dir, 'trackers')
             os.makedirs(tracker_root, exist_ok=True)
@@ -274,9 +271,6 @@ class HumanLRMTrainer(Runner):
 
     def _setup_wandb(self):
         """Initialize wandb on main process if 'wandb' is in cfg.logger.trackers."""
-        if self.cfg.runtime.get('eval_only', False):
-            self.use_wandb = False
-            return
         trackers = self.cfg.logger.get('trackers', [])
         if 'wandb' not in trackers or not self.accelerator.is_main_process:
             self.use_wandb = False
@@ -333,28 +327,16 @@ class HumanLRMTrainer(Runner):
         mc_dict = OmegaConf.to_container(mc, resolve=True)
         mc_dict.pop('model_name', None)
 
-        runtime_ckpt = self.cfg.runtime.get('checkpoint', None)
-        ckpt_path = runtime_ckpt or self.cfg.saver.get('load_model', None)
-        if ckpt_path == 'pretrained':
-            from LHM.utils.hf_hub import wrap_model_hub
-            hf_model_cls = wrap_model_hub(model_cls)
-            pretrained = hf_model_cls.from_pretrained('3DAIGC/LHM-MINI')
-            # Keep the local 4D-Dress SMPL-X/PCA renderer configuration while
-            # reusing the learned network weights from the official model.
-            self.model = model_cls(**mc_dict)
-            missing, unexpected = self.model.load_state_dict(pretrained.state_dict(), strict=False)
-            logger.info('加载预训练模型: 3DAIGC/LHM-MINI')
-            logger.info(f'预训练权重 missing={len(missing)}, unexpected={len(unexpected)}')
-        else:
-            self.model = model_cls(**mc_dict)
-            if ckpt_path:
-                if not os.path.isfile(ckpt_path):
-                    raise FileNotFoundError(f'checkpoint does not exist: {ckpt_path}')
-                state = torch.load(ckpt_path, map_location='cpu')
-                state = state.get('model', state)
-                state = {k.removeprefix('module.'): v for k, v in state.items()}
-                missing, unexpected = self.model.load_state_dict(state, strict=False)
-                logger.info(f'加载权重 {ckpt_path}，missing={len(missing)}, unexpected={len(unexpected)}')
+        self.model = model_cls(**mc_dict)
+        ckpt_path = self.cfg.saver.get('load_model', None)
+        if ckpt_path:
+            if not os.path.isfile(ckpt_path):
+                raise FileNotFoundError(f'checkpoint does not exist: {ckpt_path}')
+            state = torch.load(ckpt_path, map_location='cpu')
+            state = state.get('model', state)
+            state = {k.removeprefix('module.'): v for k, v in state.items()}
+            missing, unexpected = self.model.load_state_dict(state, strict=False)
+            logger.info(f'加载权重 {ckpt_path}，missing={len(missing)}, unexpected={len(unexpected)}')
 
         # 统计参数量
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -379,42 +361,34 @@ class HumanLRMTrainer(Runner):
 
         subsets = OmegaConf.to_container(dc.subsets, resolve=True)
 
-        eval_only = self.cfg.runtime.get('eval_only', False)
-        self.train_dataset = None
-        if not eval_only:
-            self.train_dataset = MixerDataset(
-                split='train', subsets=subsets, **dataset_kwargs
-            )
+        train_kwargs = dict(dataset_kwargs)
+        val_kwargs = dict(dataset_kwargs)
+        train_ids = train_kwargs.pop('train_sample_ids', None)
+        val_ids = val_kwargs.pop('val_sample_ids', None)
+        if train_ids is not None:
+            train_kwargs['sample_ids'] = train_ids
+        if val_ids is not None:
+            val_kwargs['sample_ids'] = val_ids
+        self.train_dataset = MixerDataset(
+            split='train', subsets=subsets, **train_kwargs
+        )
         self.val_dataset = MixerDataset(
-            split='val', subsets=subsets,
-            eval_all_views=eval_only,
-            **dataset_kwargs,
+            split='val', subsets=subsets, **val_kwargs
         )
 
         num_train_workers = dc.get('num_train_workers', 4)
         num_val_workers   = dc.get('num_val_workers', 2)
         pin_mem = dc.get('pin_mem', True)
-        if eval_only:
-            # CUDA/TorchScript modules have already been constructed by this
-            # point.  Forking DataLoader workers afterwards can segfault
-            # before Python reports an exception, so evaluation always loads
-            # samples in the main process.
-            num_train_workers = 0
-            num_val_workers = 0
-            logger.info('eval-only: DataLoader workers disabled to avoid CUDA fork')
-
-        self.train_loader = None
-        if not eval_only:
-            self.train_loader = DataLoader(
-                self.train_dataset,
-                batch_size=self.cfg.train.batch_size,
-                shuffle=True,
-                num_workers=num_train_workers,
-                pin_memory=pin_mem,
-                collate_fn=collate_fn_skip_none,
-                drop_last=True,
-                persistent_workers=num_train_workers > 0,
-            )
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=self.cfg.train.batch_size,
+            shuffle=True,
+            num_workers=num_train_workers,
+            pin_memory=pin_mem,
+            collate_fn=collate_fn_skip_none,
+            drop_last=True,
+            persistent_workers=num_train_workers > 0,
+        )
         self.val_loader = DataLoader(
             self.val_dataset,
             batch_size=self.cfg.val.get('batch_size', 2),
@@ -424,30 +398,12 @@ class HumanLRMTrainer(Runner):
             collate_fn=collate_fn_skip_none,
             drop_last=False,
         )
-        if eval_only:
-            logger.info(f'eval-only: 验证集 {len(self.val_dataset)} 样本')
-        else:
-            logger.info(f'训练集: {len(self.train_dataset)} 样本; '
-                        f'验证集: {len(self.val_dataset)} 样本')
+        logger.info(f'训练集: {len(self.train_dataset)} 样本; '
+                    f'验证集: {len(self.val_dataset)} 样本')
 
     # ── Optimizer / Scheduler ───────────────────────────────────────────────
 
     def _setup_optimizer(self):
-        if self.cfg.runtime.get('eval_only', False):
-            # Evaluation has no backward pass, optimizer, scheduler, or
-            # training loader requirement.  Preparing only the model and
-            # validation loader avoids redundant CUDA state and keeps the
-            # TorchScript Sapiens module's device move to one controlled step.
-            logger.info('eval-only: preparing model and validation loader only')
-            self.model, self.val_loader = self.accelerator.prepare(
-                self.model, self.val_loader
-            )
-            logger.info('eval-only: Accelerator preparation complete')
-            self.optimizer = None
-            self.scheduler = None
-            self.train_loader = None
-            return
-
         oc = self.cfg.train.optim
 
         if hasattr(self.model, 'obtain_params'):
@@ -599,8 +555,6 @@ class HumanLRMTrainer(Runner):
         lfc    = self.cfg.train.loss_func
 
         self.perceptual_loss = LPIPSLoss(device=device, prefech=False)
-        if self.cfg.runtime.get('eval_only', False):
-            return
         self.pixel_loss     = PixelLoss(option=lfc.get('pixel_loss', 'l1'))
 
         # ASAP（ball） loss：限制 GS 缩放各向同性
@@ -660,8 +614,6 @@ class HumanLRMTrainer(Runner):
             os.remove(old)
 
     def _resume_if_needed(self):
-        if self.cfg.runtime.get('eval_only', False):
-            return
         if not self.cfg.saver.get('auto_resume', True):
             return
         ckpt_dir = self._ckpt_dir()
@@ -877,13 +829,7 @@ class HumanLRMTrainer(Runner):
         self.model.eval()
         device  = self.accelerator.device
         val_cfg = self.cfg.val
-        eval_only = self.cfg.runtime.get('eval_only', False)
-        if eval_only:
-            logger.info(
-                f'eval-only: evaluating {len(self.val_dataset)} sample(s); '
-                f'save_render={self.cfg.runtime.get("save_render", False)}'
-            )
-        n_debug = 0 if self.cfg.runtime.get('eval_only', False) else val_cfg.get('debug_batches', 10)
+        n_debug = val_cfg.get('debug_batches', 10)
         img_mon = self.cfg.logger.get('image_monitor', {})
         n_log   = img_mon.get('samples_per_log', 2)
 
@@ -899,9 +845,6 @@ class HumanLRMTrainer(Runner):
                 continue
             if n_debug and i >= n_debug:
                 break
-            if eval_only:
-                logger.info(f'eval-only: rendering batch {i + 1}')
-
             smplx_params = {
                 k: v.to(device) for k, v in batch['smplx_params'].items()
                 if isinstance(v, torch.Tensor)
@@ -926,31 +869,20 @@ class HumanLRMTrainer(Runner):
                 'render_masks':     batch['render_masks'].to(device),
                 'source_head_rgbs': batch['source_head_rgbs'].to(device),
             }
-            losses = (
-                {} if self.cfg.runtime.get('eval_only', False)
-                else self._compute_losses(render_out, batch_dev)
-            )
+            losses = self._compute_losses(render_out, batch_dev)
             for k, v in losses.items():
                 agg[k] += v.item() if isinstance(v, torch.Tensor) else v
             for k, v in self._compute_eval_metrics(render_out, batch_dev).items():
                 agg_metrics[k] += v
             count += 1
 
-            if self.cfg.runtime.get('save_render', False) and self.accelerator.is_main_process:
-                self._save_eval_renders(render_out, batch)
-
-            # Keep the first batch only for training-time image logging.  In
-            # eval-only this would retain all 24 rendered views on GPU for no
-            # output benefit.
-            if (not self.cfg.runtime.get('eval_only', False)
-                    and first_render_out is None):
+            if first_render_out is None:
                 first_render_out = {k: v.detach() for k, v in render_out.items()
                                     if isinstance(v, torch.Tensor)}
                 first_batch     = batch
                 first_batch_dev = batch_dev
 
-        if not self.cfg.runtime.get('eval_only', False):
-            self.model.train()
+        self.model.train()
 
         # accelerator.prepare() 之后 val_loader 会把验证集切分到各 rank，每个 rank
         # 上面这段循环只跑到了自己那一份 shard。这里用固定 key 的 tensor 做一次
@@ -974,14 +906,11 @@ class HumanLRMTrainer(Runner):
         avg = {
             k: stats[n_loss + i].item() / global_count for i, k in enumerate(_METRIC_KEYS)
         }
-        if not self.cfg.runtime.get('eval_only', False):
-            losses_avg = {k: stats[i].item() / global_count for i, k in enumerate(_LOSS_KEYS)}
-            avg = {**losses_avg, 'total': sum(losses_avg.values()), **avg}
+        losses_avg = {k: stats[i].item() / global_count for i, k in enumerate(_LOSS_KEYS)}
+        avg = {**losses_avg, 'total': sum(losses_avg.values()), **avg}
+        self._log_scalars(avg, 'val', self.global_step)
 
-        if not self.cfg.runtime.get('eval_only', False):
-            self._log_scalars(avg, 'val', self.global_step)
-
-        if first_render_out is not None and not self.cfg.runtime.get('eval_only', False):
+        if first_render_out is not None:
             self._log_images_wandb(
                 first_render_out, first_batch, first_batch_dev,
                 prefix='val', n_log=n_log,
@@ -991,36 +920,9 @@ class HumanLRMTrainer(Runner):
                     ', '.join(f'{k}={v:.4f}' for k, v in avg.items()))
         return avg
 
-    @torch.no_grad()
-    def _save_eval_renders(self, render_out: dict, batch: dict):
-        """Save prediction-only renders; GT/source/masks are intentionally omitted."""
-        root = self.cfg.runtime.get('output_dir') or os.path.join(self.exp_dir, 'eval')
-        renders = render_out['comp_rgb'].detach().float().cpu()
-        uids = batch.get('uid', [f'sample_{i:05d}' for i in range(renders.shape[0])])
-        if isinstance(uids, str):
-            uids = [uids]
-        for batch_idx, uid in enumerate(uids):
-            sample_dir = os.path.join(root, 'renders', str(uid))
-            os.makedirs(sample_dir, exist_ok=True)
-            view_ids = batch.get('render_view_ids', [f'{index:02d}' for index in range(renders.shape[1])])
-            if isinstance(view_ids, list):
-                view_ids = [value[batch_idx] if isinstance(value, (list, tuple)) else value for value in view_ids]
-            for view_idx, image in enumerate(renders[batch_idx]):
-                save_image(image.clamp(0, 1), os.path.join(sample_dir, f'{view_ids[view_idx]}.png'))
-
     # ── 主训练循环 ────────────────────────────────────────────────────────────
 
     def run(self):
-        if self.cfg.runtime.get('eval_only', False):
-            metrics = self._validate()
-            if self.accelerator.is_main_process:
-                root = self.cfg.runtime.get('output_dir') or os.path.join(self.exp_dir, 'eval')
-                os.makedirs(root, exist_ok=True)
-                with open(os.path.join(root, 'metrics.json'), 'w', encoding='utf-8') as handle:
-                    json.dump(metrics, handle, indent=2)
-                logger.info(f'evaluation metrics: {os.path.join(root, "metrics.json")}')
-            return
-
         tc        = self.cfg.train
         val_cfg   = self.cfg.val
         saver_cfg = self.cfg.saver

@@ -401,13 +401,12 @@ class Dress4DLHMDataset(BaseDataset):
     """LHM-Track 4D-Dress adapter.
 
     ``root_dirs`` holds only Track metadata; images, cameras and SMPL-X stay
-    in ``raw_data_dir``.  Training consumes one ``#gNN`` target group, while
-    evaluation de-duplicates the groups and renders all 24 views.
+    in ``raw_data_dir``.  Training consumes one ``#gNN`` target group.
     """
 
     def __init__(self, root_dirs, meta_path, raw_data_dir='', source_image_res=512,
                  render_image=None, multiply=16, max_tgt_size=MAX_TGT_SIZE,
-                 enlarge_ratio=(1., 1.), eval_all_views=False, src_head_size=112,
+                 enlarge_ratio=(1., 1.), src_head_size=112,
                  crop_aspect_hw=ASPECT_HW,
                  **kwargs):
         super().__init__(root_dirs, meta_path)
@@ -420,27 +419,28 @@ class Dress4DLHMDataset(BaseDataset):
         self.crop_aspect_hw = float(crop_aspect_hw)
         if self.crop_aspect_hw <= 0:
             raise ValueError(f'crop_aspect_hw must be positive, got {crop_aspect_hw}')
-        self.eval_all_views, self.src_head_size = eval_all_views, src_head_size
+        self.src_head_size = src_head_size
         with open(os.path.join(self.root_dirs[0], 'label', 'dataset_meta.json')) as f:
             meta = json.load(f)
         self.source_view = meta['source_views'][0]
         self.target_groups = meta['target_view_groups']
         self.all_views = [f'{index:02d}' for index in range(meta['view_count'])]
-        selected = kwargs.get('eval_sample_ids')
+        selected = kwargs.get('sample_ids')
         if selected is not None:
             selected = [self._canonical_selected_uid(uid) for uid in selected]
-            # Eval normally uses val_list.json.  An explicit CLI selection is
-            # intentionally allowed to address a prepared train-list sample as
-            # well (useful for inspecting one item without changing the split).
+            # A caller may provide explicit train/test files without first
+            # regenerating labels.  Search both prepared split lists, then
+            # select only the requested samples for this dataset instance.
             entries = list(self.uids)
             available = {entry.split('#', 1)[0] for entry in entries}
             missing = [uid for uid in selected if uid not in available]
             if missing:
                 for root in self.root_dirs:
-                    path = os.path.join(root, 'label', 'train_list.json')
-                    if os.path.isfile(path):
-                        with open(path) as handle:
-                            entries.extend(json.load(handle))
+                    for split_name in ('train_list.json', 'val_list.json'):
+                        path = os.path.join(root, 'label', split_name)
+                        if os.path.isfile(path):
+                            with open(path) as handle:
+                                entries.extend(json.load(handle))
                 available = {entry.split('#', 1)[0] for entry in entries}
             missing = [uid for uid in selected if uid not in available]
             if missing:
@@ -449,8 +449,6 @@ class Dress4DLHMDataset(BaseDataset):
             self.uids = list(dict.fromkeys(
                 entry for entry in entries if entry.split('#', 1)[0] in selected_set
             ))
-        if eval_all_views:
-            self.uids = list(dict.fromkeys(uid.split('#', 1)[0] for uid in self.uids))
 
     @staticmethod
     def _parse_entry(entry):
@@ -530,7 +528,7 @@ class Dress4DLHMDataset(BaseDataset):
             cameras = json.load(f)
         with open(next(iter(sorted(glob.glob(os.path.join(sample_dir, 'smplx', '*.pkl'))))), 'rb') as f:
             params = pickle.load(f)
-        target_views = self.all_views if self.eval_all_views else self.target_groups[group_index]
+        target_views = self.target_groups[group_index]
         source_path = os.path.join(sample_dir, 'image', f'{self.source_view}.png')
         source_mask = os.path.join(sample_dir, 'mask', f'{self.source_view}.png')
         source_image, _, source_intr = _load_view(source_path, source_mask, np.asarray(cameras[self.source_view]['K']),

@@ -282,9 +282,17 @@ def parse_configs():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--infer", type=str)
+    parser.add_argument("--sample-id", action="append")
+    parser.add_argument("--sample-list", type=str)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--save-render", action="store_true")
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--dataset-root", type=str, default=None)
+    parser.add_argument("--metadata-root", type=str, default=None)
     args, unknown = parser.parse_known_args()
 
     cfg = OmegaConf.create()
+    cfg_train = None
     cli_cfg = OmegaConf.from_cli(unknown)
 
     if "export_mesh" not in cli_cfg: 
@@ -340,6 +348,20 @@ def parse_configs():
 
     cfg.motion_video_read_fps = 6
     cfg.merge_with(cli_cfg)
+    if args.sample_id:
+        cfg.sample_ids = args.sample_id
+    if args.sample_list:
+        cfg.sample_list = args.sample_list
+    if args.checkpoint:
+        cfg.checkpoint = args.checkpoint
+    if args.save_render:
+        cfg.save_render = True
+    if args.output_dir:
+        cfg.output_dir = args.output_dir
+    if args.dataset_root:
+        cfg.dataset_root = args.dataset_root
+    if args.metadata_root:
+        cfg.metadata_root = args.metadata_root
 
     cfg.setdefault("logger", "INFO")
 
@@ -367,17 +389,25 @@ class HumanLRMInferrer(Inferrer):
         # if do not download prior model, we automatically download them.
         prior_check()
 
-        self.facedetect = FaceDetector(
-            "./pretrained_models/gagatracker/vgghead/vgg_heads_l.trcd",
-            device=avaliable_device(),
-        )
-        self.pose_estimator = PoseEstimator(
-            "./pretrained_models/human_model_files/", device=avaliable_device()
-        )
-        try:
-            self.parsingnet = SAM2Seg()
-        except:
-            self.parsingnet = None 
+        self.is_4ddress_eval = self.cfg.get("input_mode") == "4ddress_eval"
+        if self.is_4ddress_eval:
+            # Track already supplies source masks and face boxes.  Avoid
+            # constructing extra detectors in the evaluation process.
+            self.facedetect = None
+            self.pose_estimator = None
+            self.parsingnet = None
+        else:
+            self.facedetect = FaceDetector(
+                "./pretrained_models/gagatracker/vgghead/vgg_heads_l.trcd",
+                device=avaliable_device(),
+            )
+            self.pose_estimator = PoseEstimator(
+                "./pretrained_models/human_model_files/", device=avaliable_device()
+            )
+            try:
+                self.parsingnet = SAM2Seg()
+            except:
+                self.parsingnet = None
 
         self.model: ModelHumanLRM = self._build_model(self.cfg).to(self.device)
 
@@ -387,8 +417,38 @@ class HumanLRMInferrer(Inferrer):
         from LHM.models import model_dict
 
         hf_model_cls = wrap_model_hub(model_dict[self.EXP_TYPE])
+        if cfg.get("input_mode") != "4ddress_eval":
+            return hf_model_cls.from_pretrained(cfg.model_name)
 
-        model = hf_model_cls.from_pretrained(cfg.model_name)
+        # Keep the official MINI architecture/inference settings (including
+        # FaceSR), but make the fixed SMPL-X layer understand 4D-Dress's
+        # 12-D hand-PCA coefficients.  This changes no learned checkpoint
+        # tensor; it only changes the parameterisation of the input body model.
+        mini_cfg = OmegaConf.load("./configs/inference/human-lrm-mini.yaml")
+        model_kwargs = OmegaConf.to_container(mini_cfg.model, resolve=True)
+        model_kwargs.pop("model_name", None)
+        model_kwargs.update(smplx_use_pca=True, smplx_num_pca_comps=12)
+        model = model_dict[self.EXP_TYPE](**model_kwargs)
+
+        pretrained = hf_model_cls.from_pretrained(cfg.model_name)
+        missing, unexpected = model.load_state_dict(pretrained.state_dict(), strict=False)
+        del pretrained
+        logger.info(
+            "loaded official pretrained weights for 4DDress evaluation: "
+            f"missing={len(missing)}, unexpected={len(unexpected)}"
+        )
+        checkpoint = cfg.get("checkpoint")
+        if checkpoint and checkpoint != "pretrained":
+            if not os.path.isfile(checkpoint):
+                raise FileNotFoundError(f"checkpoint does not exist: {checkpoint}")
+            state = torch.load(checkpoint, map_location="cpu")
+            state = state.get("model", state)
+            state = {key.removeprefix("module."): value for key, value in state.items()}
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            logger.info(
+                f"loaded local checkpoint {checkpoint}: "
+                f"missing={len(missing)}, unexpected={len(unexpected)}"
+            )
         return model
 
     def _default_source_camera(
@@ -813,6 +873,10 @@ class HumanLRMInferrer(Inferrer):
         )
 
     def infer(self):
+
+        if self.is_4ddress_eval:
+            from .dress4d_eval import evaluate_4ddress
+            return evaluate_4ddress(self)
 
         image_paths = []
         if os.path.isfile(self.cfg.image_input):
