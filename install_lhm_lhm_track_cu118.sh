@@ -31,7 +31,7 @@ cat "${LHM_DIR}/requirements.txt" "${TRACK_DIR}/requirements.txt" \
 pip install -r "${REQ_FILE}"
 
 pip uninstall -y basicsr
-pip install git+https://github.com/XPixelGroup/BasicSR
+pip install --no-build-isolation git+https://github.com/XPixelGroup/BasicSR
 pip install --no-build-isolation git+https://github.com/facebookresearch/pytorch3d.git
 pip install --no-build-isolation git+https://github.com/ashawkey/diff-gaussian-rasterization/
 pip install --no-build-isolation git+https://github.com/camenduru/simple-knn/
